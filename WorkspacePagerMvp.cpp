@@ -397,8 +397,8 @@ static void CaptureThumbnailForDesktop(int index)
     int thumbWidth = max(1, block.right - block.left - DpiScale(g_window, 4));
     int thumbHeight = max(1, block.bottom - block.top - DpiScale(g_window, 9));
 
-    HWND foreground = GetForegroundWindow();
-    HMONITOR monitor = MonitorFromWindow(foreground != nullptr ? foreground : g_window, MONITOR_DEFAULTTONEAREST);
+    POINT primaryPoint{0, 0};
+    HMONITOR monitor = MonitorFromPoint(primaryPoint, MONITOR_DEFAULTTOPRIMARY);
     MONITORINFO monitorInfo{};
     monitorInfo.cbSize = sizeof(monitorInfo);
     if (!GetMonitorInfoW(monitor, &monitorInfo))
@@ -980,6 +980,58 @@ static bool DrawDesktopThumbnail(HDC dc, HWND pagerWindow, RECT card, HBITMAP th
     return true;
 }
 
+static COLORREF NudgeTaskbarColor(COLORREF color)
+{
+    int r = min(255, GetRValue(color) + 8);
+    int g = min(255, GetGValue(color) + 8);
+    int b = min(255, GetBValue(color) + 8);
+    COLORREF nudged = RGB(r, g, b);
+    return nudged == RGB(255, 0, 255) ? RGB(254, 0, 254) : nudged;
+}
+
+static COLORREF SampleTaskbarHitBackground(HWND window)
+{
+    RECT taskbarRect{};
+    RECT windowRect{};
+    if (!GetWindowRect(g_taskbar, &taskbarRect) || !GetWindowRect(window, &windowRect))
+    {
+        return RGB(245, 245, 245);
+    }
+
+    int midY = taskbarRect.top + (taskbarRect.bottom - taskbarRect.top) / 2;
+    POINT candidates[] = {
+        {windowRect.left - DpiScale(window, 6), midY},
+        {windowRect.right + DpiScale(window, 6), midY},
+        {taskbarRect.right - DpiScale(window, 12), midY},
+        {taskbarRect.left + DpiScale(window, 12), midY},
+    };
+
+    HDC screenDc = GetDC(nullptr);
+    if (screenDc == nullptr)
+    {
+        return RGB(245, 245, 245);
+    }
+
+    COLORREF color = RGB(245, 245, 245);
+    for (POINT point : candidates)
+    {
+        if (!PtInRect(&taskbarRect, point) || PtInRect(&windowRect, point))
+        {
+            continue;
+        }
+
+        COLORREF sampled = GetPixel(screenDc, point.x, point.y);
+        if (sampled != CLR_INVALID && sampled != RGB(255, 0, 255))
+        {
+            color = sampled;
+            break;
+        }
+    }
+
+    ReleaseDC(nullptr, screenDc);
+    return NudgeTaskbarColor(color);
+}
+
 static void RenderPager(HWND window)
 {
     RECT client{};
@@ -1009,33 +1061,21 @@ static void RenderPager(HWND window)
 
     COLORREF activeBar = RGB(0, 120, 212);
     COLORREF inactiveBar = RGB(120, 120, 120);
-    COLORREF hitBackground = RGB(245, 245, 245);
-    RECT windowRect{};
-    if (GetWindowRect(window, &windowRect))
-    {
-        HDC screenDc = GetDC(nullptr);
-        if (screenDc != nullptr)
-        {
-            COLORREF sampled = GetPixel(screenDc, windowRect.left + width / 2, windowRect.top + height / 2);
-            if (sampled != CLR_INVALID && sampled != RGB(255, 0, 255))
-            {
-                hitBackground = sampled;
-            }
-            ReleaseDC(nullptr, screenDc);
-        }
-    }
+    COLORREF hitBackground = SampleTaskbarHitBackground(window);
 
     for (int i = 0; i < static_cast<int>(g_state.ids.size()); ++i)
     {
         RECT rect = BlockRect(window, i);
         bool active = i == g_state.currentIndex;
 
-        // Color-key transparency also affects hit-testing. Filling the item with
-        // the sampled taskbar color keeps it visually blended while preserving
-        // mouse wheel/click events across the whole item.
-        HBRUSH hitBrush = CreateSolidBrush(hitBackground);
-        FillRect(memoryDc, &rect, hitBrush);
-        DeleteObject(hitBrush);
+        // A fully color-keyed card does not reliably receive mouse input.
+        // Keep a near-transparent hit target that avoids the magenta color key.
+        if (active)
+        {
+            HBRUSH hitBrush = CreateSolidBrush(hitBackground);
+            FillRect(memoryDc, &rect, hitBrush);
+            DeleteObject(hitBrush);
+        }
 
         if (!active)
         {
