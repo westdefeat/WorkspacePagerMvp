@@ -1,8 +1,10 @@
 #include <windows.h>
 #include <windowsx.h>
 #include <ole2.h>
+#include <shellapi.h>
 #include <cstdarg>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 static const GUID CLSID_ImmersiveShell = {0xC2F03A33, 0x21F5, 0x47FA, {0xB4, 0xBB, 0x15, 0x63, 0x62, 0xA2, 0xF2, 0x39}};
@@ -17,7 +19,13 @@ static const GUID IID_IVirtualDesktop = {0x3F07F4BE, 0xB107, 0x441A, {0xAF, 0x0F
 
 static const wchar_t* WindowClassName = L"WorkspacePagerMvpWindow";
 static const UINT WM_VD_CHANGED = WM_APP + 1;
+static const WPARAM VdChangedRefresh = 0;
+static const WPARAM VdChangedSwitch = 1;
 static const UINT_PTR RepositionTimerId = 1;
+static const UINT_PTR DesktopRefreshTimerId = 2;
+static const UINT_PTR ForegroundRefreshTimerId = 3;
+static const UINT_PTR SwitchRefreshTimerId = 4;
+static const UINT DesktopStructureRefreshDelayMs = 1500;
 
 struct IVirtualDesktop : IUnknown
 {
@@ -91,19 +99,23 @@ struct IVirtualDesktopNotificationService : IUnknown
 struct DesktopState
 {
     std::vector<GUID> ids;
-    std::vector<int> windowCounts;
+    std::vector<HWND> foregroundWindows;
+    std::vector<HBITMAP> thumbnails;
     int currentIndex = 0;
 };
 
 static HWND g_window = nullptr;
 static HWND g_taskbar = nullptr;
 static HWND g_tray = nullptr;
+static HHOOK g_keyboardHook = nullptr;
 static IServiceProvider* g_shell = nullptr;
 static IVirtualDesktopManagerInternal* g_desktopManager = nullptr;
 static IVirtualDesktopManager* g_publicDesktopManager = nullptr;
 static IVirtualDesktopNotificationService* g_notificationService = nullptr;
 static DWORD g_notificationCookie = 0;
 static DesktopState g_state;
+static DWORD g_ignoreSwitchEventsUntil = 0;
+static DWORD g_ignoreKeyboardCaptureUntil = 0;
 static void Log(const char* format, ...)
 {
     FILE* log = nullptr;
@@ -129,6 +141,23 @@ static COLORREF Blend(COLORREF from, COLORREF to, double t)
     return RGB(r, g, b);
 }
 
+static LONG WINAPI UnhandledExceptionHandler(EXCEPTION_POINTERS* exceptionInfo)
+{
+    if (exceptionInfo != nullptr && exceptionInfo->ExceptionRecord != nullptr)
+    {
+        Log(
+            "Unhandled exception code=0x%08X address=0x%p",
+            static_cast<unsigned>(exceptionInfo->ExceptionRecord->ExceptionCode),
+            exceptionInfo->ExceptionRecord->ExceptionAddress);
+    }
+    else
+    {
+        Log("Unhandled exception without exception record");
+    }
+
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
 static void ReleaseUnknown(IUnknown* object)
 {
     if (object != nullptr)
@@ -136,6 +165,9 @@ static void ReleaseUnknown(IUnknown* object)
         object->Release();
     }
 }
+
+static int DpiScale(HWND window, int value);
+static RECT BlockRect(HWND window, int index);
 
 static IVirtualDesktop* GetDesktopAt(UINT index)
 {
@@ -170,6 +202,54 @@ static int FindDesktopIndexById(const GUID& id)
     return -1;
 }
 
+static int FindDesktopIndexIn(const std::vector<GUID>& ids, const GUID& id)
+{
+    for (size_t i = 0; i < ids.size(); ++i)
+    {
+        if (IsEqualGUID(ids[i], id))
+        {
+            return static_cast<int>(i);
+        }
+    }
+
+    return -1;
+}
+
+static int GetCurrentDesktopIndexFromRegistry()
+{
+    BYTE data[sizeof(GUID)]{};
+    DWORD dataSize = sizeof(data);
+    LSTATUS status = RegGetValueW(
+        HKEY_CURRENT_USER,
+        L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\VirtualDesktops",
+        L"CurrentVirtualDesktop",
+        RRF_RT_REG_BINARY,
+        nullptr,
+        data,
+        &dataSize);
+    if (status != ERROR_SUCCESS || dataSize < sizeof(GUID))
+    {
+        Log("Read CurrentVirtualDesktop failed status=%ld size=%lu", status, dataSize);
+        return -1;
+    }
+
+    GUID currentId{};
+    memcpy(&currentId, data, sizeof(GUID));
+    return FindDesktopIndexById(currentId);
+}
+
+static void ClearThumbnails(std::vector<HBITMAP>& thumbnails)
+{
+    for (HBITMAP thumbnail : thumbnails)
+    {
+        if (thumbnail != nullptr)
+        {
+            DeleteObject(thumbnail);
+        }
+    }
+    thumbnails.clear();
+}
+
 static bool IsAppWindow(HWND window)
 {
     if (window == nullptr || window == g_window || !IsWindowVisible(window))
@@ -201,25 +281,29 @@ static bool IsAppWindow(HWND window)
     return true;
 }
 
-static BOOL CALLBACK CountWindowForDesktop(HWND window, LPARAM)
+static void AssignForegroundWindowForDesktop(HWND window)
 {
     if (!IsAppWindow(window) || g_publicDesktopManager == nullptr)
     {
-        return TRUE;
+        return;
     }
 
     GUID desktopId{};
     if (FAILED(g_publicDesktopManager->GetWindowDesktopId(window, &desktopId)))
     {
-        return TRUE;
+        return;
     }
 
     int index = FindDesktopIndexById(desktopId);
-    if (index >= 0 && static_cast<size_t>(index) < g_state.windowCounts.size())
+    if (index >= 0 && static_cast<size_t>(index) < g_state.foregroundWindows.size() && g_state.foregroundWindows[index] == nullptr)
     {
-        g_state.windowCounts[index]++;
+        g_state.foregroundWindows[index] = window;
     }
+}
 
+static BOOL CALLBACK FindForegroundWindowForDesktop(HWND window, LPARAM)
+{
+    AssignForegroundWindowForDesktop(window);
     return TRUE;
 }
 
@@ -249,19 +333,9 @@ static void RefreshDesktopState()
             desktops->Release();
         }
 
-        IVirtualDesktop* current = g_desktopManager->GetCurrentDesktop();
-        if (current != nullptr)
+        if (!next.ids.empty())
         {
-            GUID currentId = current->GetId();
-            for (size_t i = 0; i < next.ids.size(); ++i)
-            {
-                if (IsEqualGUID(next.ids[i], currentId))
-                {
-                    next.currentIndex = static_cast<int>(i);
-                    break;
-                }
-            }
-            current->Release();
+            next.currentIndex = min(g_state.currentIndex, static_cast<int>(next.ids.size()) - 1);
         }
     }
 
@@ -271,9 +345,142 @@ static void RefreshDesktopState()
         next.currentIndex = 0;
     }
 
-    next.windowCounts.assign(next.ids.size(), 0);
+    next.foregroundWindows.assign(next.ids.size(), nullptr);
+    next.thumbnails.assign(next.ids.size(), nullptr);
+    for (size_t i = 0; i < next.ids.size(); ++i)
+    {
+        int oldIndex = FindDesktopIndexIn(g_state.ids, next.ids[i]);
+        if (oldIndex >= 0 && static_cast<size_t>(oldIndex) < g_state.thumbnails.size())
+        {
+            next.thumbnails[i] = g_state.thumbnails[oldIndex];
+            g_state.thumbnails[oldIndex] = nullptr;
+        }
+    }
+    ClearThumbnails(g_state.thumbnails);
     g_state = next;
-    EnumWindows(CountWindowForDesktop, 0);
+
+    HWND foreground = GetForegroundWindow();
+    AssignForegroundWindowForDesktop(foreground);
+    EnumWindows(FindForegroundWindowForDesktop, 0);
+}
+
+static void RefreshCurrentForegroundWindow()
+{
+    if (g_state.currentIndex < 0 || static_cast<size_t>(g_state.currentIndex) >= g_state.foregroundWindows.size())
+    {
+        return;
+    }
+
+    HWND foreground = GetForegroundWindow();
+    if (IsAppWindow(foreground))
+    {
+        g_state.foregroundWindows[g_state.currentIndex] = foreground;
+    }
+}
+
+static void ScheduleForegroundRefresh(HWND window, UINT delayMs = 250)
+{
+    if (window != nullptr)
+    {
+        SetTimer(window, ForegroundRefreshTimerId, delayMs, nullptr);
+    }
+}
+
+static void CaptureThumbnailForDesktop(int index)
+{
+    if (index < 0 || static_cast<size_t>(index) >= g_state.thumbnails.size() || g_window == nullptr)
+    {
+        return;
+    }
+
+    RECT block = BlockRect(g_window, index);
+    int thumbWidth = max(1, block.right - block.left - DpiScale(g_window, 4));
+    int thumbHeight = max(1, block.bottom - block.top - DpiScale(g_window, 9));
+
+    HWND foreground = GetForegroundWindow();
+    HMONITOR monitor = MonitorFromWindow(foreground != nullptr ? foreground : g_window, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO monitorInfo{};
+    monitorInfo.cbSize = sizeof(monitorInfo);
+    if (!GetMonitorInfoW(monitor, &monitorInfo))
+    {
+        return;
+    }
+
+    RECT source = monitorInfo.rcWork;
+    int sourceWidth = source.right - source.left;
+    int sourceHeight = source.bottom - source.top;
+    if (sourceWidth <= 0 || sourceHeight <= 0)
+    {
+        return;
+    }
+
+    HDC screenDc = GetDC(nullptr);
+    HDC memoryDc = CreateCompatibleDC(screenDc);
+    HBITMAP bitmap = CreateCompatibleBitmap(screenDc, thumbWidth, thumbHeight);
+    if (bitmap == nullptr)
+    {
+        DeleteDC(memoryDc);
+        ReleaseDC(nullptr, screenDc);
+        return;
+    }
+
+    HGDIOBJ oldBitmap = SelectObject(memoryDc, bitmap);
+    SetStretchBltMode(memoryDc, HALFTONE);
+    SetBrushOrgEx(memoryDc, 0, 0, nullptr);
+    BOOL ok = StretchBlt(
+        memoryDc,
+        0,
+        0,
+        thumbWidth,
+        thumbHeight,
+        screenDc,
+        source.left,
+        source.top,
+        sourceWidth,
+        sourceHeight,
+        SRCCOPY | CAPTUREBLT);
+    SelectObject(memoryDc, oldBitmap);
+    DeleteDC(memoryDc);
+    ReleaseDC(nullptr, screenDc);
+
+    if (!ok)
+    {
+        DeleteObject(bitmap);
+        Log("Capture thumbnail failed index=%d err=%lu", index, GetLastError());
+        return;
+    }
+
+    if (g_state.thumbnails[index] != nullptr)
+    {
+        DeleteObject(g_state.thumbnails[index]);
+    }
+    g_state.thumbnails[index] = bitmap;
+    Log("Captured thumbnail index=%d size=%dx%d", index, thumbWidth, thumbHeight);
+}
+
+static LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lParam)
+{
+    if (code == HC_ACTION && (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) && GetTickCount() >= g_ignoreKeyboardCaptureUntil)
+    {
+        KBDLLHOOKSTRUCT* keyboard = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
+        bool arrow = keyboard != nullptr && (keyboard->vkCode == VK_LEFT || keyboard->vkCode == VK_RIGHT);
+        bool ctrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0 ||
+                    (GetAsyncKeyState(VK_LCONTROL) & 0x8000) != 0 ||
+                    (GetAsyncKeyState(VK_RCONTROL) & 0x8000) != 0;
+        bool win = (GetAsyncKeyState(VK_LWIN) & 0x8000) != 0 ||
+                   (GetAsyncKeyState(VK_RWIN) & 0x8000) != 0;
+
+        static DWORD lastCaptureTick = 0;
+        DWORD now = GetTickCount();
+        if (arrow && ctrl && win && now - lastCaptureTick > 150)
+        {
+            lastCaptureTick = now;
+            Log("Keyboard pre-switch capture current=%d", g_state.currentIndex);
+            CaptureThumbnailForDesktop(g_state.currentIndex);
+        }
+    }
+
+    return CallNextHookEx(g_keyboardHook, code, wParam, lParam);
 }
 
 static int DpiScale(HWND window, int value)
@@ -293,8 +500,8 @@ static int DpiScale(HWND window, int value)
 static int PagerWidth(HWND window)
 {
     int count = static_cast<int>(g_state.ids.size());
-    int block = DpiScale(window, 42);
-    int gap = DpiScale(window, 6);
+    int block = DpiScale(window, 54);
+    int gap = DpiScale(window, 5);
     int padding = DpiScale(window, 6);
     return padding * 2 + count * block + max(0, count - 1) * gap;
 }
@@ -304,17 +511,18 @@ static RECT BlockRect(HWND window, int index)
     RECT client{};
     GetClientRect(window, &client);
 
-    int block = DpiScale(window, 42);
-    int gap = DpiScale(window, 6);
+    int block = DpiScale(window, 54);
+    int gap = DpiScale(window, 5);
     int totalWidth = PagerWidth(window);
     int startX = (client.right - client.left - totalWidth) / 2 + DpiScale(window, 6);
-    int y = (client.bottom - client.top - DpiScale(window, 24)) / 2;
+    int blockHeight = DpiScale(window, 34);
+    int y = (client.bottom - client.top - blockHeight) / 2;
 
     RECT rect{};
     rect.left = startX + index * (block + gap);
     rect.top = y;
     rect.right = rect.left + block;
-    rect.bottom = rect.top + DpiScale(window, 24);
+    rect.bottom = rect.top + blockHeight;
     return rect;
 }
 
@@ -339,7 +547,7 @@ static void RepositionOverlay(HWND window)
     int taskbarWidth = taskbarRect.right - taskbarRect.left;
     int taskbarHeight = taskbarRect.bottom - taskbarRect.top;
     int width = PagerWidth(window);
-    int height = min(taskbarHeight, DpiScale(window, 34));
+    int height = min(taskbarHeight, DpiScale(window, 40));
     int trayLeft = g_tray == nullptr ? taskbarWidth - DpiScale(window, 96) : trayRect.left - taskbarRect.left;
     int x = max(DpiScale(window, 8), trayLeft - width - DpiScale(window, 8));
     int y = max(0, (taskbarHeight - height) / 2);
@@ -386,15 +594,15 @@ public:
     }
 
     HRESULT STDMETHODCALLTYPE VirtualDesktopCreated(IVirtualDesktop*) override { NotifyRefresh("Created"); return S_OK; }
-    HRESULT STDMETHODCALLTYPE VirtualDesktopDestroyBegin(IVirtualDesktop*, IVirtualDesktop*) override { NotifyRefresh("DestroyBegin"); return S_OK; }
-    HRESULT STDMETHODCALLTYPE VirtualDesktopDestroyFailed(IVirtualDesktop*, IVirtualDesktop*) override { NotifyRefresh("DestroyFailed"); return S_OK; }
+    HRESULT STDMETHODCALLTYPE VirtualDesktopDestroyBegin(IVirtualDesktop*, IVirtualDesktop*) override { Log("VD event: DestroyBegin"); return S_OK; }
+    HRESULT STDMETHODCALLTYPE VirtualDesktopDestroyFailed(IVirtualDesktop*, IVirtualDesktop*) override { Log("VD event: DestroyFailed"); return S_OK; }
     HRESULT STDMETHODCALLTYPE VirtualDesktopDestroyed(IVirtualDesktop*, IVirtualDesktop*) override { NotifyRefresh("Destroyed"); return S_OK; }
     HRESULT STDMETHODCALLTYPE VirtualDesktopMoved(IVirtualDesktop*, INT64, INT64) override { NotifyRefresh("Moved"); return S_OK; }
     HRESULT STDMETHODCALLTYPE VirtualDesktopNameChanged(IVirtualDesktop*, void*) override { Notify(); return S_OK; }
     HRESULT STDMETHODCALLTYPE ViewVirtualDesktopChanged(IUnknown*) override { return S_OK; }
-    HRESULT STDMETHODCALLTYPE CurrentVirtualDesktopChanged(IVirtualDesktop*, IVirtualDesktop* desktopNew) override { NotifyCurrent("CurrentChanged", desktopNew); return S_OK; }
+    HRESULT STDMETHODCALLTYPE CurrentVirtualDesktopChanged(IVirtualDesktop*, IVirtualDesktop*) override { NotifySwitch("CurrentChanged"); return S_OK; }
     HRESULT STDMETHODCALLTYPE VirtualDesktopWallpaperChanged(IVirtualDesktop*, void*) override { return S_OK; }
-    HRESULT STDMETHODCALLTYPE VirtualDesktopSwitched(IVirtualDesktop* desktop, int) override { NotifyCurrent("Switched", desktop); return S_OK; }
+    HRESULT STDMETHODCALLTYPE VirtualDesktopSwitched(IVirtualDesktop*, int) override { Log("VD event: Switched"); return S_OK; }
     HRESULT STDMETHODCALLTYPE RemoteVirtualDesktopConnected(IVirtualDesktop*) override { NotifyRefresh("RemoteConnected"); return S_OK; }
 
 private:
@@ -412,20 +620,21 @@ private:
         Notify();
     }
 
-    void NotifyCurrent(const char* eventName, IVirtualDesktop* desktop)
+    void NotifySwitch(const char* eventName)
     {
-        int index = -1;
-        if (desktop != nullptr)
+        Log("VD event: %s", eventName);
+        if (GetTickCount() < g_ignoreSwitchEventsUntil)
         {
-            index = FindDesktopIndexById(desktop->GetId());
+            Log("VD switch event ignored during local switch");
+            return;
         }
 
-        Log("VD event: %s index=%d", eventName, index);
         if (g_window != nullptr)
         {
-            PostMessageW(g_window, WM_VD_CHANGED, index >= 0 ? static_cast<WPARAM>(index + 1) : 0, 0);
+            PostMessageW(g_window, WM_VD_CHANGED, VdChangedSwitch, 0);
         }
     }
+
 };
 
 static NotificationSink* g_sink = nullptr;
@@ -466,12 +675,19 @@ static bool InitializeVirtualDesktop()
     }
 
     RefreshDesktopState();
+    int registryCurrentIndex = GetCurrentDesktopIndexFromRegistry();
+    if (registryCurrentIndex >= 0)
+    {
+        g_state.currentIndex = registryCurrentIndex;
+    }
     Log("Initial desktops=%zu current=%d", g_state.ids.size(), g_state.currentIndex);
     return true;
 }
 
 static void ShutdownVirtualDesktop()
 {
+    ClearThumbnails(g_state.thumbnails);
+
     if (g_notificationService != nullptr && g_notificationCookie != 0)
     {
         g_notificationService->Unregister(g_notificationCookie);
@@ -514,6 +730,8 @@ static void SendVirtualDesktopShortcut(bool moveRight)
     SendKey(VK_CONTROL, true);
 }
 
+static void RenderPager(HWND window);
+
 static void SwitchToDesktop(int index)
 {
     if (index < 0 || index >= static_cast<int>(g_state.ids.size()) || index == g_state.currentIndex)
@@ -526,6 +744,12 @@ static void SwitchToDesktop(int index)
     {
         int delta = index - g_state.currentIndex;
         Log("Send Ctrl+Win+Arrow target=%d current=%d delta=%d", index, g_state.currentIndex, delta);
+        RefreshCurrentForegroundWindow();
+        CaptureThumbnailForDesktop(g_state.currentIndex);
+        g_state.currentIndex = index;
+        g_ignoreSwitchEventsUntil = GetTickCount() + static_cast<DWORD>(max(900, abs(delta) * 450));
+        g_ignoreKeyboardCaptureUntil = GetTickCount() + static_cast<DWORD>(max(900, abs(delta) * 450));
+        RenderPager(g_window);
         for (int i = 0; i < abs(delta); ++i)
         {
             SendVirtualDesktopShortcut(delta > 0);
@@ -558,70 +782,289 @@ static void StrokeRoundedRect(HDC dc, RECT rect, int radius, COLORREF color, int
     DeleteObject(pen);
 }
 
-static void DrawMiniWindows(HDC dc, HWND window, RECT card, int count, bool active)
+static void FillRectAlpha(unsigned char* pixels, int width, int height, RECT rect, COLORREF color, unsigned char alpha)
 {
-    int visibleCount = min(max(count, 1), 4);
-    COLORREF windowColor = active ? RGB(236, 248, 255) : RGB(205, 205, 205);
-    COLORREF titleColor = active ? RGB(0, 120, 212) : RGB(135, 135, 135);
+    rect.left = max(0, min(rect.left, width));
+    rect.right = max(0, min(rect.right, width));
+    rect.top = max(0, min(rect.top, height));
+    rect.bottom = max(0, min(rect.bottom, height));
 
-    for (int i = 0; i < visibleCount; ++i)
+    unsigned char r = static_cast<unsigned char>(GetRValue(color));
+    unsigned char g = static_cast<unsigned char>(GetGValue(color));
+    unsigned char b = static_cast<unsigned char>(GetBValue(color));
+
+    // UpdateLayeredWindow expects premultiplied BGRA.
+    unsigned char pr = static_cast<unsigned char>((static_cast<int>(r) * alpha) / 255);
+    unsigned char pg = static_cast<unsigned char>((static_cast<int>(g) * alpha) / 255);
+    unsigned char pb = static_cast<unsigned char>((static_cast<int>(b) * alpha) / 255);
+
+    for (int y = rect.top; y < rect.bottom; ++y)
     {
-        int col = i % 2;
-        int row = i / 2;
-        int left = card.left + DpiScale(window, 6) + col * DpiScale(window, 15);
-        int top = card.top + DpiScale(window, 6) + row * DpiScale(window, 8);
-        RECT mini{left, top, left + DpiScale(window, 12), top + DpiScale(window, 7)};
-
-        HBRUSH body = CreateSolidBrush(windowColor);
-        FillRect(dc, &mini, body);
-        DeleteObject(body);
-
-        RECT title{mini.left, mini.top, mini.right, mini.top + DpiScale(window, 2)};
-        HBRUSH titleBrush = CreateSolidBrush(titleColor);
-        FillRect(dc, &title, titleBrush);
-        DeleteObject(titleBrush);
+        unsigned char* row = pixels + y * width * 4;
+        for (int x = rect.left; x < rect.right; ++x)
+        {
+            unsigned char* pixel = row + x * 4;
+            pixel[0] = pb;
+            pixel[1] = pg;
+            pixel[2] = pr;
+            pixel[3] = alpha;
+        }
     }
 }
 
-static void PaintPager(HWND window)
+static void RepairAlphaInRect(unsigned char* pixels, int width, int height, RECT rect)
 {
-    PAINTSTRUCT ps{};
-    HDC dc = BeginPaint(window, &ps);
+    rect.left = max(0, min(rect.left, width));
+    rect.right = max(0, min(rect.right, width));
+    rect.top = max(0, min(rect.top, height));
+    rect.bottom = max(0, min(rect.bottom, height));
 
+    for (int y = rect.top; y < rect.bottom; ++y)
+    {
+        unsigned char* row = pixels + y * width * 4;
+        for (int x = rect.left; x < rect.right; ++x)
+        {
+            unsigned char* pixel = row + x * 4;
+            if (pixel[3] == 0 && (pixel[0] != 0 || pixel[1] != 0 || pixel[2] != 0))
+            {
+                pixel[3] = 255;
+            }
+        }
+    }
+}
+
+struct IconResult
+{
+    HICON icon = nullptr;
+    bool owned = false;
+};
+
+static IconResult GetProcessIcon(HWND window)
+{
+    DWORD processId = 0;
+    GetWindowThreadProcessId(window, &processId);
+    if (processId == 0)
+    {
+        return {};
+    }
+
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId);
+    if (process == nullptr)
+    {
+        return {};
+    }
+
+    wchar_t path[MAX_PATH]{};
+    DWORD pathLength = MAX_PATH;
+    BOOL ok = QueryFullProcessImageNameW(process, 0, path, &pathLength);
+    CloseHandle(process);
+    if (!ok || path[0] == L'\0')
+    {
+        return {};
+    }
+
+    SHFILEINFOW fileInfo{};
+    DWORD_PTR result = SHGetFileInfoW(
+        path,
+        0,
+        &fileInfo,
+        sizeof(fileInfo),
+        SHGFI_ICON | SHGFI_LARGEICON);
+    if (result == 0 || fileInfo.hIcon == nullptr)
+    {
+        return {};
+    }
+
+    return {fileInfo.hIcon, true};
+}
+
+static IconResult GetWindowIcon(HWND window)
+{
+    if (window == nullptr || !IsWindow(window))
+    {
+        return {};
+    }
+
+    IconResult processIcon = GetProcessIcon(window);
+    if (processIcon.icon != nullptr)
+    {
+        return processIcon;
+    }
+
+    HICON icon = reinterpret_cast<HICON>(SendMessageW(window, WM_GETICON, ICON_BIG, 0));
+    if (icon == nullptr)
+    {
+        icon = reinterpret_cast<HICON>(GetClassLongPtrW(window, GCLP_HICON));
+    }
+    if (icon == nullptr)
+    {
+        icon = reinterpret_cast<HICON>(SendMessageW(window, WM_GETICON, ICON_SMALL2, 0));
+    }
+    if (icon == nullptr)
+    {
+        icon = reinterpret_cast<HICON>(SendMessageW(window, WM_GETICON, ICON_SMALL, 0));
+    }
+    if (icon == nullptr)
+    {
+        icon = reinterpret_cast<HICON>(GetClassLongPtrW(window, GCLP_HICONSM));
+    }
+
+    return {icon, false};
+}
+
+static RECT DrawDesktopIcon(HDC dc, HWND pagerWindow, RECT card, HWND appWindow, bool active)
+{
+    int iconSize = DpiScale(pagerWindow, 24);
+    int x = card.left + ((card.right - card.left) - iconSize) / 2;
+    int y = card.top + ((card.bottom - card.top) - iconSize) / 2;
+    RECT iconRect{x, y, x + iconSize, y + iconSize};
+
+    IconResult icon = GetWindowIcon(appWindow);
+    if (icon.icon != nullptr)
+    {
+        DrawIconEx(dc, x, y, icon.icon, iconSize, iconSize, 0, nullptr, DI_NORMAL);
+        if (icon.owned)
+        {
+            DestroyIcon(icon.icon);
+        }
+        return iconRect;
+    }
+
+    HBRUSH brush = CreateSolidBrush(active ? RGB(0, 120, 212) : RGB(190, 190, 190));
+    DrawRoundedRect(dc, iconRect, DpiScale(pagerWindow, 4), brush);
+    DeleteObject(brush);
+    return iconRect;
+}
+
+static bool DrawDesktopThumbnail(HDC dc, HWND pagerWindow, RECT card, HBITMAP thumbnail)
+{
+    if (thumbnail == nullptr)
+    {
+        return false;
+    }
+
+    BITMAP bitmapInfo{};
+    if (GetObjectW(thumbnail, sizeof(bitmapInfo), &bitmapInfo) == 0 || bitmapInfo.bmWidth <= 0 || bitmapInfo.bmHeight <= 0)
+    {
+        return false;
+    }
+
+    RECT thumbRect{
+        card.left + DpiScale(pagerWindow, 2),
+        card.top + DpiScale(pagerWindow, 2),
+        card.right - DpiScale(pagerWindow, 2),
+        card.bottom - DpiScale(pagerWindow, 7)};
+    if (thumbRect.right <= thumbRect.left || thumbRect.bottom <= thumbRect.top)
+    {
+        return false;
+    }
+
+    HDC sourceDc = CreateCompatibleDC(dc);
+    HGDIOBJ oldBitmap = SelectObject(sourceDc, thumbnail);
+    SetStretchBltMode(dc, HALFTONE);
+    SetBrushOrgEx(dc, 0, 0, nullptr);
+    StretchBlt(
+        dc,
+        thumbRect.left,
+        thumbRect.top,
+        thumbRect.right - thumbRect.left,
+        thumbRect.bottom - thumbRect.top,
+        sourceDc,
+        0,
+        0,
+        bitmapInfo.bmWidth,
+        bitmapInfo.bmHeight,
+        SRCCOPY);
+    SelectObject(sourceDc, oldBitmap);
+    DeleteDC(sourceDc);
+    return true;
+}
+
+static void RenderPager(HWND window)
+{
     RECT client{};
     GetClientRect(window, &client);
+    int width = client.right - client.left;
+    int height = client.bottom - client.top;
+    if (width <= 0 || height <= 0)
+    {
+        return;
+    }
 
-    HDC memoryDc = CreateCompatibleDC(dc);
-    HBITMAP bitmap = CreateCompatibleBitmap(dc, client.right - client.left, client.bottom - client.top);
+    HDC windowDc = GetDC(window);
+    HDC memoryDc = CreateCompatibleDC(windowDc);
+    HBITMAP bitmap = CreateCompatibleBitmap(windowDc, width, height);
+    if (bitmap == nullptr)
+    {
+        DeleteDC(memoryDc);
+        ReleaseDC(window, windowDc);
+        return;
+    }
+
     HGDIOBJ oldBitmap = SelectObject(memoryDc, bitmap);
 
     HBRUSH transparentBrush = CreateSolidBrush(RGB(255, 0, 255));
     FillRect(memoryDc, &client, transparentBrush);
     DeleteObject(transparentBrush);
 
-    COLORREF activeBackground = RGB(31, 111, 187);
-    COLORREF inactiveBackground = RGB(64, 64, 64);
-    COLORREF inactiveBorder = RGB(122, 122, 122);
+    COLORREF activeBar = RGB(0, 120, 212);
+    COLORREF inactiveBar = RGB(120, 120, 120);
+    COLORREF hitBackground = RGB(245, 245, 245);
+    RECT windowRect{};
+    if (GetWindowRect(window, &windowRect))
+    {
+        HDC screenDc = GetDC(nullptr);
+        if (screenDc != nullptr)
+        {
+            COLORREF sampled = GetPixel(screenDc, windowRect.left + width / 2, windowRect.top + height / 2);
+            if (sampled != CLR_INVALID && sampled != RGB(255, 0, 255))
+            {
+                hitBackground = sampled;
+            }
+            ReleaseDC(nullptr, screenDc);
+        }
+    }
 
     for (int i = 0; i < static_cast<int>(g_state.ids.size()); ++i)
     {
         RECT rect = BlockRect(window, i);
         bool active = i == g_state.currentIndex;
-        HBRUSH brush = CreateSolidBrush(active ? activeBackground : inactiveBackground);
-        DrawRoundedRect(memoryDc, rect, DpiScale(window, 5), brush);
-        DeleteObject(brush);
 
-        int count = static_cast<size_t>(i) < g_state.windowCounts.size() ? g_state.windowCounts[i] : 0;
-        DrawMiniWindows(memoryDc, window, rect, count, active);
-        StrokeRoundedRect(memoryDc, rect, DpiScale(window, 5), active ? RGB(180, 225, 255) : inactiveBorder, active ? DpiScale(window, 2) : DpiScale(window, 1));
+        // Color-key transparency also affects hit-testing. Filling the item with
+        // the sampled taskbar color keeps it visually blended while preserving
+        // mouse wheel/click events across the whole item.
+        HBRUSH hitBrush = CreateSolidBrush(hitBackground);
+        FillRect(memoryDc, &rect, hitBrush);
+        DeleteObject(hitBrush);
+
+        if (!active)
+        {
+            HBITMAP thumbnail = static_cast<size_t>(i) < g_state.thumbnails.size() ? g_state.thumbnails[i] : nullptr;
+            if (!DrawDesktopThumbnail(memoryDc, window, rect, thumbnail))
+            {
+                HWND appWindow = static_cast<size_t>(i) < g_state.foregroundWindows.size() ? g_state.foregroundWindows[i] : nullptr;
+                DrawDesktopIcon(memoryDc, window, rect, appWindow, active);
+            }
+        }
+
+        int barWidth = DpiScale(window, active ? 30 : 18);
+        int barHeight = DpiScale(window, active ? 3 : 2);
+        int barX = rect.left + ((rect.right - rect.left) - barWidth) / 2;
+        RECT bar{
+            barX,
+            rect.bottom - DpiScale(window, 4),
+            barX + barWidth,
+            rect.bottom - DpiScale(window, 4) + barHeight};
+        HBRUSH barBrush = CreateSolidBrush(active ? activeBar : inactiveBar);
+        FillRect(memoryDc, &bar, barBrush);
+        DeleteObject(barBrush);
     }
 
-    BitBlt(dc, 0, 0, client.right - client.left, client.bottom - client.top, memoryDc, 0, 0, SRCCOPY);
+    BitBlt(windowDc, 0, 0, width, height, memoryDc, 0, 0, SRCCOPY);
     SelectObject(memoryDc, oldBitmap);
     DeleteObject(bitmap);
     DeleteDC(memoryDc);
-
-    EndPaint(window, &ps);
+    ReleaseDC(window, windowDc);
 }
 
 static LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
@@ -635,24 +1078,53 @@ static LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPA
     case WM_TIMER:
         if (wParam == RepositionTimerId)
         {
+            RefreshCurrentForegroundWindow();
             RepositionOverlay(window);
+            RenderPager(window);
+        }
+        else if (wParam == DesktopRefreshTimerId)
+        {
+            KillTimer(window, DesktopRefreshTimerId);
+            Log("Delayed desktop refresh begin");
+            RefreshDesktopState();
+            Log("Delayed desktop refresh desktops=%zu current=%d", g_state.ids.size(), g_state.currentIndex);
+            RepositionOverlay(window);
+            RenderPager(window);
+        }
+        else if (wParam == ForegroundRefreshTimerId)
+        {
+            KillTimer(window, ForegroundRefreshTimerId);
+            RefreshCurrentForegroundWindow();
+            CaptureThumbnailForDesktop(g_state.currentIndex);
+            Log("Foreground icon refresh current=%d", g_state.currentIndex);
+            RenderPager(window);
+        }
+        else if (wParam == SwitchRefreshTimerId)
+        {
+            KillTimer(window, SwitchRefreshTimerId);
+            int registryCurrentIndex = GetCurrentDesktopIndexFromRegistry();
+            if (registryCurrentIndex >= 0 && static_cast<size_t>(registryCurrentIndex) < g_state.ids.size())
+            {
+                g_state.currentIndex = registryCurrentIndex;
+                Log("Registry switch refresh current=%d", g_state.currentIndex);
+                RenderPager(window);
+            }
         }
         return 0;
 
     case WM_VD_CHANGED:
-        if (wParam > 0 && static_cast<size_t>(wParam - 1) < g_state.ids.size())
+        if (wParam == VdChangedSwitch)
         {
-            g_state.currentIndex = static_cast<int>(wParam - 1);
-            Log("WM_VD_CHANGED set current=%d", g_state.currentIndex);
+            KillTimer(window, SwitchRefreshTimerId);
+            SetTimer(window, SwitchRefreshTimerId, 150, nullptr);
+            Log("WM_VD_CHANGED scheduled registry switch refresh");
         }
         else
         {
-            RefreshDesktopState();
-            Log("WM_VD_CHANGED refresh desktops=%zu current=%d", g_state.ids.size(), g_state.currentIndex);
+            KillTimer(window, DesktopRefreshTimerId);
+            SetTimer(window, DesktopRefreshTimerId, DesktopStructureRefreshDelayMs, nullptr);
+            Log("WM_VD_CHANGED scheduled delayed refresh");
         }
-        RepositionOverlay(window);
-        InvalidateRect(window, nullptr, FALSE);
-        UpdateWindow(window);
         return 0;
 
     case WM_LBUTTONUP:
@@ -670,19 +1142,39 @@ static LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPA
         return 0;
     }
 
+    case WM_MOUSEWHEEL:
+    {
+        int count = static_cast<int>(g_state.ids.size());
+        if (count <= 1)
+        {
+            return 0;
+        }
+
+        int delta = GET_WHEEL_DELTA_WPARAM(wParam);
+        int direction = delta < 0 ? 1 : -1;
+        int target = (g_state.currentIndex + direction + count) % count;
+        Log("Mouse wheel delta=%d target=%d", delta, target);
+        SwitchToDesktop(target);
+        return 0;
+    }
+
     case WM_PAINT:
-        PaintPager(window);
+        ValidateRect(window, nullptr);
+        RenderPager(window);
         return 0;
 
     case WM_DISPLAYCHANGE:
     case WM_SETTINGCHANGE:
     case WM_DPICHANGED:
         RepositionOverlay(window);
-        InvalidateRect(window, nullptr, FALSE);
+        RenderPager(window);
         return 0;
 
     case WM_DESTROY:
         KillTimer(window, RepositionTimerId);
+        KillTimer(window, DesktopRefreshTimerId);
+        KillTimer(window, ForegroundRefreshTimerId);
+        KillTimer(window, SwitchRefreshTimerId);
         PostQuitMessage(0);
         return 0;
     }
@@ -692,6 +1184,7 @@ static LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPA
 
 int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int)
 {
+    SetUnhandledExceptionFilter(UnhandledExceptionHandler);
     Log("Starting WorkspacePagerMvp");
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
@@ -701,6 +1194,9 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int)
         CoUninitialize();
         return 1;
     }
+
+    g_keyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, GetModuleHandleW(nullptr), 0);
+    Log("Keyboard hook hwnd=0x%p err=%lu", g_keyboardHook, GetLastError());
 
     WNDCLASSEXW wc{};
     wc.cbSize = sizeof(wc);
@@ -746,12 +1242,12 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int)
         return 1;
     }
 
-    SetLayeredWindowAttributes(g_window, RGB(255, 0, 255), 0, LWA_COLORKEY);
     HWND oldParent = SetParent(g_window, g_taskbar);
     Log("SetParent old=0x%p err=%lu", oldParent, GetLastError());
+    SetLayeredWindowAttributes(g_window, RGB(255, 0, 255), 0, LWA_COLORKEY);
     RepositionOverlay(g_window);
+    RenderPager(g_window);
     ShowWindow(g_window, SW_SHOWNOACTIVATE);
-    UpdateWindow(g_window);
     Log("Entering message loop");
 
     MSG message{};
@@ -762,6 +1258,11 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int)
     }
 
     ShutdownVirtualDesktop();
+    if (g_keyboardHook != nullptr)
+    {
+        UnhookWindowsHookEx(g_keyboardHook);
+        g_keyboardHook = nullptr;
+    }
     CoUninitialize();
     Log("Exiting WorkspacePagerMvp");
     return 0;

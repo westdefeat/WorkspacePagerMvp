@@ -17,6 +17,8 @@ if (-not (Test-Path $clang)) {
     -loleaut32 `
     -luuid `
     -luser32 `
+    -lshell32 `
+    -ladvapi32 `
     -lgdi32 `
     -o $Output
 
