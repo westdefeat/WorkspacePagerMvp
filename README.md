@@ -1,138 +1,123 @@
 # WorkspacePagerMvp
 
-Windows taskbar workspace pager MVP. It shows your virtual desktops as cached taskbar thumbnails and lets you switch desktops by clicking or scrolling.
+WorkspacePagerMvp is a small Win32/C++ prototype that adds a virtual desktop pager to the Windows taskbar. It shows one block per Windows virtual desktop, keeps cached thumbnail previews for inactive desktops, and lets you switch desktops by clicking or using the mouse wheel.
 
-Windows 任务栏虚拟桌面指示器 MVP。它会把当前虚拟桌面显示成任务栏上的缓存缩略图，并支持点击或滚轮切换桌面。
+The project is intentionally minimal: a single native source file, a PowerShell build script, and no external runtime dependency. It is built as an experiment around the Windows virtual desktop APIs and taskbar overlay behavior.
 
-## Features / 功能
+## Features
 
-- Shows all current Windows virtual desktops.
-- Captures and caches a thumbnail for a desktop when leaving it.
-- Falls back to the foreground/topmost app icon when a desktop has no cached thumbnail yet.
-- Shows the current desktop as an empty placeholder with a highlighted underline, because it is live and not continuously captured.
-- Highlights the active desktop.
-- Updates through Windows virtual desktop notification events.
-- Switches desktops with the native `Ctrl + Win + Left/Right` shortcut path for smoother animation.
-- Supports mouse wheel switching on the indicator, including wrapping from the last desktop to the first.
-- Runs as a taskbar overlay near the system tray.
-- Does not create its own taskbar button.
+- Shows all current Windows virtual desktops in a compact taskbar overlay.
+- Highlights the active desktop with an underline.
+- Captures a cached thumbnail when leaving a desktop and reuses it as that desktop's preview.
+- Falls back to the foreground app icon when a desktop does not have a cached thumbnail yet.
+- Leaves the current desktop preview blank because it is live and is not continuously captured.
+- Updates after virtual desktop create, destroy, move, rename, and switch notifications.
+- Switches desktops through the native `Ctrl + Win + Left/Right` path for smooth Windows animations.
+- Supports mouse wheel switching on the pager, including wraparound from the last desktop to the first.
+- Stays near the system tray and does not create its own taskbar button.
 
-- 显示当前所有 Windows 虚拟桌面。
-- 离开某个桌面时截取并缓存该桌面的缩略图。
-- 如果某个桌面还没有缓存缩略图，则回退显示前台/最上层应用图标。
-- 当前桌面显示为空白占位并使用高亮横杠，因为当前桌面是实时变化的，不会持续截图。
-- 高亮当前桌面。
-- 通过 Windows 虚拟桌面事件通知实时刷新。
-- 使用系统原生 `Ctrl + Win + 左/右` 快捷键路径切换，动画更顺滑。
-- 支持在指示器上使用鼠标滚轮切换桌面，包括从最后一个循环到第一个。
-- 作为任务栏 overlay 显示在系统托盘左侧附近。
-- 不在任务栏生成自己的程序按钮。
+## Screenshot
 
-## Files / 文件
+No screenshot is included yet. The UI is a thin taskbar overlay made of desktop preview blocks, with the active desktop marked by a highlighted bottom bar.
 
-- `WorkspacePagerMvp.cpp`: main Win32/C++ source file.
-- `build.ps1`: PowerShell build script.
-- `WorkspacePagerMvp.exe`: generated executable after building.
-- `WorkspacePagerMvp.log`: runtime diagnostic log, generated automatically.
+## Requirements
 
-- `WorkspacePagerMvp.cpp`：Win32/C++ 主源码。
-- `build.ps1`：PowerShell 构建脚本。
-- `WorkspacePagerMvp.exe`：构建后生成的可执行文件。
-- `WorkspacePagerMvp.log`：运行时诊断日志，会自动生成。
-
-## Run / 运行
-
-From PowerShell:
-
-在 PowerShell 中运行：
-
-```powershell
-cd c:\Users\xiaolin\source\windows_workspaces\WorkspacePagerMvp
-.\WorkspacePagerMvp.exe
-```
-
-Stop it with:
-
-停止程序：
-
-```powershell
-taskkill /IM WorkspacePagerMvp.exe /F
-```
-
-## Build / 构建
-
-Requires LLVM `clang++` at:
-
-需要本机安装 LLVM `clang++`，默认路径：
+- Windows 11, tested on build `10.0.26220`.
+- LLVM `clang++`, expected by default at:
 
 ```text
 C:\Program Files\LLVM\bin\clang++.exe
 ```
 
-Build:
+## Build
 
-构建：
+From PowerShell:
 
 ```powershell
-cd c:\Users\xiaolin\source\windows_workspaces\WorkspacePagerMvp
+cd "c:\Users\xiaolin\source\windows_workspaces\WorkspacePagerMvp"
 powershell -ExecutionPolicy Bypass -File .\build.ps1
 ```
 
-Build to a custom output name:
-
-构建到自定义文件名：
+Build with a custom output file name:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\build.ps1 -Output WorkspacePagerMvpDebug.exe
 ```
 
-## Notes / 说明
+The build script compiles `WorkspacePagerMvp.cpp` with C++17 and links directly against the Win32 libraries used by the app.
 
-This tool uses undocumented Windows virtual desktop COM interfaces. It is known to work on the tested Windows build `10.0.26220`, but these internal interface IDs and vtables may change after Windows updates.
+## Run
 
-本工具使用了未公开的 Windows 虚拟桌面 COM 接口。它已在当前测试系统 `10.0.26220` 上验证可用，但这些内部接口的 GUID 和 vtable 可能会随 Windows 更新变化。
+```powershell
+cd "c:\Users\xiaolin\source\windows_workspaces\WorkspacePagerMvp"
+.\WorkspacePagerMvp.exe
+```
 
-The thumbnails are cached snapshots, not live previews. Windows does not provide a public API for third-party apps to capture live thumbnails of inactive virtual desktops. The tool captures the currently visible desktop before/after switching and reuses that cached image for the matching desktop.
+Stop the running process:
 
-当前缩略图是缓存截图，不是实时预览。Windows 没有公开 API 允许第三方直接获取非活动虚拟桌面的实时缩略图。本工具会在切换前后截取当前可见桌面，并把缓存图用于对应桌面。
+```powershell
+taskkill /IM WorkspacePagerMvp.exe /F
+```
 
-## Current Limitations / 当前限制
+## How It Works
 
-- The overlay cannot reserve real taskbar space, so it cannot push pinned taskbar icons aside.
-- The safest position is near the system tray on the right side.
-- Clicking a non-adjacent desktop switches through intermediate desktops because it follows the native `Ctrl + Win + Left/Right` shortcut path.
-- Manual `Ctrl + Win + Left/Right` switching is detected through shell notifications, but direction is inferred conservatively because the undocumented callback object is intentionally not dereferenced for stability.
-- If Windows changes the virtual desktop COM interfaces, the tool may need an update.
+WorkspacePagerMvp uses a small always-on-top Win32 overlay window positioned near the Windows taskbar tray area. The overlay paints one slot per virtual desktop. Each slot can show a cached desktop bitmap, an application icon fallback, or an empty current-desktop placeholder.
 
-- overlay 无法真正占用任务栏布局空间，因此不能把固定图标挤开。
-- 当前最稳的位置是在右侧系统托盘附近。
-- 点击非相邻桌面时，会通过中间桌面切过去，因为它走的是原生 `Ctrl + Win + 左/右` 快捷键路径。
-- 手动 `Ctrl + Win + 左/右` 切换会通过 Shell 通知同步，但为了稳定性不会解引用未公开回调对象，因此方向只能保守推断。
-- 如果 Windows 更新改变虚拟桌面 COM 接口，工具可能需要适配。
+For virtual desktop state, the app uses the documented `IVirtualDesktopManager` interface where possible, but it also calls undocumented Shell COM interfaces such as `IVirtualDesktopManagerInternal`, `IVirtualDesktopNotificationService`, `IVirtualDesktopNotification`, and `IVirtualDesktop`. These interfaces are used to enumerate desktops, identify the current desktop, and receive desktop change notifications.
 
-## Troubleshooting / 故障排查
+For switching, the app intentionally sends the native `Ctrl + Win + Left/Right` shortcut instead of directly invoking the internal switch method. This keeps Windows' own transition animation and avoids depending on more internal behavior than necessary.
 
-If the indicator does not appear:
+## Important Notes
 
-如果指示器没有出现：
+This is an MVP and uses undocumented Windows virtual desktop COM interfaces. Those GUIDs, vtables, and callback shapes are not part of Microsoft's stable public API. They may change after Windows updates, especially on Insider builds.
+
+The previews are cached snapshots, not live previews. Windows does not expose a public API that lets third-party apps capture live thumbnails of inactive virtual desktops. WorkspacePagerMvp captures the visible desktop around switching time and reuses that bitmap as a best-effort preview.
+
+## Current Limitations
+
+- The overlay cannot reserve real taskbar layout space, so it cannot push pinned taskbar icons aside.
+- The safest placement is near the right-side system tray area.
+- Clicking a non-adjacent desktop switches through intermediate desktops because the app follows the native keyboard shortcut path.
+- Manual `Ctrl + Win + Left/Right` switching is detected through Shell notifications, but direction is inferred conservatively for stability.
+- Windows updates may require updating the internal virtual desktop interface definitions.
+
+## Troubleshooting
+
+Check whether the process is running:
 
 ```powershell
 tasklist /FI "IMAGENAME eq WorkspacePagerMvp.exe"
 ```
 
-Check the log:
-
-查看日志：
+Check the runtime log:
 
 ```powershell
 Get-Content .\WorkspacePagerMvp.log
 ```
 
-Restart:
-
-重启：
+Restart the app:
 
 ```powershell
 taskkill /IM WorkspacePagerMvp.exe /F
 .\WorkspacePagerMvp.exe
 ```
+
+## References and Credits
+
+WorkspacePagerMvp does not vendor or link against the projects below, but they were useful references for understanding the undocumented Windows virtual desktop surface and the tradeoffs involved.
+
+- [Ciantic/VirtualDesktopAccessor](https://github.com/Ciantic/VirtualDesktopAccessor): a widely used DLL for accessing Windows 10/11 virtual desktop features, especially from AutoHotkey. Useful as a reference for COM identifiers, exported desktop operations, and the reality of per-build compatibility.
+- [Slion/VirtualDesktop](https://github.com/Slion/VirtualDesktop): a C# wrapper around `IVirtualDesktopManager` and related undocumented interfaces. Useful for understanding the interface set and the need to handle Windows build-specific changes.
+- [dankrusi/WindowsVirtualDesktopHelper](https://github.com/dankrusi/WindowsVirtualDesktopHelper): a lightweight helper app for showing and switching virtual desktops. Useful as a product-level reference for tray/taskbar virtual desktop indicators.
+- [shanselman/MaximizeToVirtualDesktop](https://github.com/shanselman/MaximizeToVirtualDesktop): documents the difference between Microsoft's limited documented virtual desktop API and the undocumented interfaces needed for richer desktop control.
+- [Microsoft PowerToys issue #6797](https://github.com/microsoft/PowerToys/issues/6797): useful background on why PowerToys avoids undocumented virtual desktop APIs and why this area remains fragile for third-party tools.
+
+## 中文简介
+
+WorkspacePagerMvp 是一个 Windows 任务栏虚拟桌面分页器原型。它会在任务栏托盘附近显示每个虚拟桌面的预览块，支持点击和鼠标滚轮切换桌面。
+
+项目主要用英文文档维护。需要注意的是，它使用了 Windows 未公开的虚拟桌面 COM 接口，因此 Windows 更新后可能需要重新适配接口定义。
+
+## License
+
+MIT License. See `LICENSE`.
