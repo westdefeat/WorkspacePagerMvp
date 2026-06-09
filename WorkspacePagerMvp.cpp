@@ -19,13 +19,21 @@ static const GUID IID_IVirtualDesktop = {0x3F07F4BE, 0xB107, 0x441A, {0xAF, 0x0F
 
 static const wchar_t* WindowClassName = L"WorkspacePagerMvpWindow";
 static const UINT WM_VD_CHANGED = WM_APP + 1;
+static const UINT WM_TRAYICON = WM_APP + 2;
+static const UINT WM_TASKBAR_REFRESH = WM_APP + 3;
 static const WPARAM VdChangedRefresh = 0;
 static const WPARAM VdChangedSwitch = 1;
 static const UINT_PTR RepositionTimerId = 1;
 static const UINT_PTR DesktopRefreshTimerId = 2;
 static const UINT_PTR ForegroundRefreshTimerId = 3;
 static const UINT_PTR SwitchRefreshTimerId = 4;
+static const UINT_PTR TaskbarRefreshTimerId = 5;
 static const UINT DesktopStructureRefreshDelayMs = 1500;
+static const UINT TaskbarRefreshDelayMs = 25;
+static const UINT TaskbarRefreshBurstDelayMs = 16;
+static const UINT TrayIconId = 1;
+static const UINT TrayMenuSettingsCommand = 1001;
+static const UINT TrayMenuExitCommand = 1002;
 
 struct IVirtualDesktop : IUnknown
 {
@@ -108,6 +116,8 @@ static HWND g_window = nullptr;
 static HWND g_taskbar = nullptr;
 static HWND g_tray = nullptr;
 static HHOOK g_keyboardHook = nullptr;
+static HHOOK g_mouseHook = nullptr;
+static HWINEVENTHOOK g_taskbarEventHook = nullptr;
 static IServiceProvider* g_shell = nullptr;
 static IVirtualDesktopManagerInternal* g_desktopManager = nullptr;
 static IVirtualDesktopManager* g_publicDesktopManager = nullptr;
@@ -116,6 +126,10 @@ static DWORD g_notificationCookie = 0;
 static DesktopState g_state;
 static DWORD g_ignoreSwitchEventsUntil = 0;
 static DWORD g_ignoreKeyboardCaptureUntil = 0;
+static int g_hoverIndex = -1;
+static int g_taskbarRefreshBurstsRemaining = 0;
+static bool g_trackingMouse = false;
+static bool g_trayIconAdded = false;
 static void Log(const char* format, ...)
 {
     FILE* log = nullptr;
@@ -167,7 +181,10 @@ static void ReleaseUnknown(IUnknown* object)
 }
 
 static int DpiScale(HWND window, int value);
+static int HoverPreviewContentWidth(HWND window);
+static int HoverPreviewContentHeight(HWND window);
 static RECT BlockRect(HWND window, int index);
+static RECT HoverPreviewRect(HWND window, int index);
 
 static IVirtualDesktop* GetDesktopAt(UINT index)
 {
@@ -393,9 +410,9 @@ static void CaptureThumbnailForDesktop(int index)
         return;
     }
 
-    RECT block = BlockRect(g_window, index);
-    int thumbWidth = max(1, block.right - block.left - DpiScale(g_window, 4));
-    int thumbHeight = max(1, block.bottom - block.top - DpiScale(g_window, 9));
+    int thumbScale = 2;
+    int thumbWidth = max(1, HoverPreviewContentWidth(g_window) * thumbScale);
+    int thumbHeight = max(1, HoverPreviewContentHeight(g_window) * thumbScale);
 
     POINT primaryPoint{0, 0};
     HMONITOR monitor = MonitorFromPoint(primaryPoint, MONITOR_DEFAULTTOPRIMARY);
@@ -506,6 +523,47 @@ static int PagerWidth(HWND window)
     return padding * 2 + count * block + max(0, count - 1) * gap;
 }
 
+static int HoverPreviewWidth(HWND window)
+{
+    return DpiScale(window, 220);
+}
+
+static int HoverPreviewHeight(HWND window)
+{
+    return DpiScale(window, 126);
+}
+
+static int HoverPreviewContentWidth(HWND window)
+{
+    return HoverPreviewWidth(window) - DpiScale(window, 12);
+}
+
+static int HoverPreviewContentHeight(HWND window)
+{
+    return HoverPreviewHeight(window) - DpiScale(window, 12);
+}
+
+static int OverlayPreviewBandHeight(HWND window)
+{
+    return HoverPreviewHeight(window) + DpiScale(window, 14);
+}
+
+static int OverlayWidth(HWND window)
+{
+    return max(PagerWidth(window), HoverPreviewWidth(window) + DpiScale(window, 12));
+}
+
+static int IndicatorBandHeight(HWND window)
+{
+    return DpiScale(window, 40);
+}
+
+static int OverlayHeight(HWND window, int taskbarHeight)
+{
+    int indicatorBand = min(taskbarHeight, IndicatorBandHeight(window));
+    return indicatorBand + OverlayPreviewBandHeight(window);
+}
+
 static RECT BlockRect(HWND window, int index)
 {
     RECT client{};
@@ -516,7 +574,9 @@ static RECT BlockRect(HWND window, int index)
     int totalWidth = PagerWidth(window);
     int startX = (client.right - client.left - totalWidth) / 2 + DpiScale(window, 6);
     int blockHeight = DpiScale(window, 34);
-    int y = (client.bottom - client.top - blockHeight) / 2;
+    int indicatorBand = min(client.bottom - client.top, IndicatorBandHeight(window));
+    int bandTop = client.bottom - indicatorBand;
+    int y = bandTop + (indicatorBand - blockHeight) / 2;
 
     RECT rect{};
     rect.left = startX + index * (block + gap);
@@ -524,6 +584,56 @@ static RECT BlockRect(HWND window, int index)
     rect.right = rect.left + block;
     rect.bottom = rect.top + blockHeight;
     return rect;
+}
+
+static RECT HoverPreviewRect(HWND window, int index)
+{
+    RECT client{};
+    GetClientRect(window, &client);
+
+    RECT block = BlockRect(window, index);
+    int previewWidth = HoverPreviewWidth(window);
+    int previewHeight = HoverPreviewHeight(window);
+    int margin = DpiScale(window, 6);
+    int gap = DpiScale(window, 8);
+    int centerX = block.left + (block.right - block.left) / 2;
+
+    RECT rect{};
+    rect.left = centerX - previewWidth / 2;
+    rect.right = rect.left + previewWidth;
+    if (rect.left < client.left + margin)
+    {
+        rect.left = client.left + margin;
+        rect.right = rect.left + previewWidth;
+    }
+    if (rect.right > client.right - margin)
+    {
+        rect.right = client.right - margin;
+        rect.left = rect.right - previewWidth;
+    }
+
+    rect.top = block.top - gap - previewHeight;
+    rect.bottom = rect.top + previewHeight;
+    if (rect.top < client.top + margin)
+    {
+        rect.top = client.top + margin;
+        rect.bottom = rect.top + previewHeight;
+    }
+    return rect;
+}
+
+static int HitTestDesktopIndex(HWND window, POINT point)
+{
+    for (int i = 0; i < static_cast<int>(g_state.ids.size()); ++i)
+    {
+        RECT rect = BlockRect(window, i);
+        if (PtInRect(&rect, point))
+        {
+            return i;
+        }
+    }
+
+    return -1;
 }
 
 static void RepositionOverlay(HWND window)
@@ -546,13 +656,133 @@ static void RepositionOverlay(HWND window)
     GetWindowRect(g_tray, &trayRect);
     int taskbarWidth = taskbarRect.right - taskbarRect.left;
     int taskbarHeight = taskbarRect.bottom - taskbarRect.top;
-    int width = PagerWidth(window);
-    int height = min(taskbarHeight, DpiScale(window, 40));
+    int width = OverlayWidth(window);
+    int height = OverlayHeight(window, taskbarHeight);
     int trayLeft = g_tray == nullptr ? taskbarWidth - DpiScale(window, 96) : trayRect.left - taskbarRect.left;
-    int x = max(DpiScale(window, 8), trayLeft - width - DpiScale(window, 8));
-    int y = max(0, (taskbarHeight - height) / 2);
+    int x = taskbarRect.left + max(DpiScale(window, 8), trayLeft - width - DpiScale(window, 8));
+    int y = taskbarRect.bottom - height;
 
-    SetWindowPos(window, nullptr, x, y, width, height, SWP_NOACTIVATE | SWP_NOZORDER);
+    SetWindowPos(window, HWND_TOPMOST, x, y, width, height, SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
+}
+
+static bool IsTaskbarRelatedWindow(HWND window)
+{
+    if (window == nullptr || window == g_window)
+    {
+        return false;
+    }
+
+    HWND current = window;
+    for (int depth = 0; current != nullptr && depth < 4; ++depth)
+    {
+        if (current == g_taskbar || current == g_tray)
+        {
+            return true;
+        }
+
+        wchar_t className[128]{};
+        GetClassNameW(current, className, 128);
+        if (wcscmp(className, L"Shell_TrayWnd") == 0 ||
+            wcscmp(className, L"Shell_SecondaryTrayWnd") == 0 ||
+            wcscmp(className, L"TrayNotifyWnd") == 0 ||
+            wcscmp(className, L"NotifyIconOverflowWindow") == 0 ||
+            wcscmp(className, L"TopLevelWindowForOverflowXamlIsland") == 0)
+        {
+            return true;
+        }
+
+        current = GetAncestor(current, GA_PARENT);
+    }
+
+    return false;
+}
+
+static bool IsPointInTaskbarArea(POINT point)
+{
+    if (g_taskbar == nullptr)
+    {
+        g_taskbar = FindWindowW(L"Shell_TrayWnd", nullptr);
+    }
+    if (g_taskbar == nullptr)
+    {
+        return false;
+    }
+
+    RECT taskbarRect{};
+    return GetWindowRect(g_taskbar, &taskbarRect) && PtInRect(&taskbarRect, point);
+}
+
+static void ScheduleTaskbarRefresh(UINT delayMs = TaskbarRefreshDelayMs, int burstCount = 10)
+{
+    if (g_window == nullptr)
+    {
+        return;
+    }
+
+    g_taskbarRefreshBurstsRemaining = max(g_taskbarRefreshBurstsRemaining, burstCount);
+    KillTimer(g_window, TaskbarRefreshTimerId);
+    SetTimer(g_window, TaskbarRefreshTimerId, delayMs == 0 ? 1 : delayMs, nullptr);
+}
+
+static void CALLBACK TaskbarEventProc(
+    HWINEVENTHOOK,
+    DWORD,
+    HWND eventWindow,
+    LONG objectId,
+    LONG,
+    DWORD,
+    DWORD)
+{
+    if (g_window == nullptr || objectId != OBJID_WINDOW || !IsTaskbarRelatedWindow(eventWindow))
+    {
+        return;
+    }
+
+    PostMessageW(g_window, WM_TASKBAR_REFRESH, 0, 0);
+}
+
+static LRESULT CALLBACK LowLevelMouseProc(int code, WPARAM wParam, LPARAM lParam)
+{
+    if (code == HC_ACTION &&
+        (wParam == WM_LBUTTONDOWN || wParam == WM_LBUTTONUP || wParam == WM_RBUTTONDOWN || wParam == WM_RBUTTONUP))
+    {
+        MSLLHOOKSTRUCT* mouse = reinterpret_cast<MSLLHOOKSTRUCT*>(lParam);
+        if (mouse != nullptr && IsPointInTaskbarArea(mouse->pt) && g_window != nullptr)
+        {
+            PostMessageW(g_window, WM_TASKBAR_REFRESH, 1, 0);
+        }
+    }
+
+    return CallNextHookEx(g_mouseHook, code, wParam, lParam);
+}
+
+static void RegisterTaskbarEventHook()
+{
+    if (g_taskbarEventHook != nullptr)
+    {
+        return;
+    }
+
+    g_taskbarEventHook = SetWinEventHook(
+        EVENT_OBJECT_SHOW,
+        EVENT_OBJECT_LOCATIONCHANGE,
+        nullptr,
+        TaskbarEventProc,
+        0,
+        0,
+        WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+    Log("Taskbar event hook=0x%p err=%lu", g_taskbarEventHook, GetLastError());
+}
+
+static void UnregisterTaskbarEventHook()
+{
+    if (g_taskbarEventHook == nullptr)
+    {
+        return;
+    }
+
+    UnhookWinEvent(g_taskbarEventHook);
+    g_taskbarEventHook = nullptr;
 }
 
 class NotificationSink : public IVirtualDesktopNotification
@@ -833,6 +1063,61 @@ static void RepairAlphaInRect(unsigned char* pixels, int width, int height, RECT
     }
 }
 
+static void ApplyColorKeyAlpha(unsigned char* pixels, int width, int height, COLORREF transparentColor)
+{
+    unsigned char transparentR = static_cast<unsigned char>(GetRValue(transparentColor));
+    unsigned char transparentG = static_cast<unsigned char>(GetGValue(transparentColor));
+    unsigned char transparentB = static_cast<unsigned char>(GetBValue(transparentColor));
+
+    for (int y = 0; y < height; ++y)
+    {
+        unsigned char* row = pixels + y * width * 4;
+        for (int x = 0; x < width; ++x)
+        {
+            unsigned char* pixel = row + x * 4;
+            bool transparent = pixel[0] == transparentB && pixel[1] == transparentG && pixel[2] == transparentR;
+            pixel[3] = transparent ? 0 : 255;
+            if (transparent)
+            {
+                pixel[0] = 0;
+                pixel[1] = 0;
+                pixel[2] = 0;
+            }
+        }
+    }
+}
+
+static void EnsureMinimumAlphaInRect(unsigned char* pixels, int width, int height, RECT rect, COLORREF color, unsigned char alpha)
+{
+    rect.left = max(0, min(rect.left, width));
+    rect.right = max(0, min(rect.right, width));
+    rect.top = max(0, min(rect.top, height));
+    rect.bottom = max(0, min(rect.bottom, height));
+
+    unsigned char r = static_cast<unsigned char>(GetRValue(color));
+    unsigned char g = static_cast<unsigned char>(GetGValue(color));
+    unsigned char b = static_cast<unsigned char>(GetBValue(color));
+    unsigned char pr = static_cast<unsigned char>((static_cast<int>(r) * alpha) / 255);
+    unsigned char pg = static_cast<unsigned char>((static_cast<int>(g) * alpha) / 255);
+    unsigned char pb = static_cast<unsigned char>((static_cast<int>(b) * alpha) / 255);
+
+    for (int y = rect.top; y < rect.bottom; ++y)
+    {
+        unsigned char* row = pixels + y * width * 4;
+        for (int x = rect.left; x < rect.right; ++x)
+        {
+            unsigned char* pixel = row + x * 4;
+            if (pixel[3] < alpha)
+            {
+                pixel[0] = pb;
+                pixel[1] = pg;
+                pixel[2] = pr;
+                pixel[3] = alpha;
+            }
+        }
+    }
+}
+
 struct IconResult
 {
     HICON icon = nullptr;
@@ -936,39 +1221,33 @@ static RECT DrawDesktopIcon(HDC dc, HWND pagerWindow, RECT card, HWND appWindow,
     return iconRect;
 }
 
-static bool DrawDesktopThumbnail(HDC dc, HWND pagerWindow, RECT card, HBITMAP thumbnail)
+static bool DrawBitmapScaled(HDC dc, RECT target, HBITMAP bitmap)
 {
-    if (thumbnail == nullptr)
+    if (bitmap == nullptr)
     {
         return false;
     }
 
     BITMAP bitmapInfo{};
-    if (GetObjectW(thumbnail, sizeof(bitmapInfo), &bitmapInfo) == 0 || bitmapInfo.bmWidth <= 0 || bitmapInfo.bmHeight <= 0)
+    if (GetObjectW(bitmap, sizeof(bitmapInfo), &bitmapInfo) == 0 || bitmapInfo.bmWidth <= 0 || bitmapInfo.bmHeight <= 0)
     {
         return false;
     }
-
-    RECT thumbRect{
-        card.left + DpiScale(pagerWindow, 2),
-        card.top + DpiScale(pagerWindow, 2),
-        card.right - DpiScale(pagerWindow, 2),
-        card.bottom - DpiScale(pagerWindow, 7)};
-    if (thumbRect.right <= thumbRect.left || thumbRect.bottom <= thumbRect.top)
+    if (target.right <= target.left || target.bottom <= target.top)
     {
         return false;
     }
 
     HDC sourceDc = CreateCompatibleDC(dc);
-    HGDIOBJ oldBitmap = SelectObject(sourceDc, thumbnail);
+    HGDIOBJ oldBitmap = SelectObject(sourceDc, bitmap);
     SetStretchBltMode(dc, HALFTONE);
     SetBrushOrgEx(dc, 0, 0, nullptr);
     StretchBlt(
         dc,
-        thumbRect.left,
-        thumbRect.top,
-        thumbRect.right - thumbRect.left,
-        thumbRect.bottom - thumbRect.top,
+        target.left,
+        target.top,
+        target.right - target.left,
+        target.bottom - target.top,
         sourceDc,
         0,
         0,
@@ -978,6 +1257,40 @@ static bool DrawDesktopThumbnail(HDC dc, HWND pagerWindow, RECT card, HBITMAP th
     SelectObject(sourceDc, oldBitmap);
     DeleteDC(sourceDc);
     return true;
+}
+
+static bool DrawDesktopThumbnail(HDC dc, HWND pagerWindow, RECT card, HBITMAP thumbnail)
+{
+    RECT thumbRect{
+        card.left + DpiScale(pagerWindow, 2),
+        card.top + DpiScale(pagerWindow, 2),
+        card.right - DpiScale(pagerWindow, 2),
+        card.bottom - DpiScale(pagerWindow, 7)};
+    return DrawBitmapScaled(dc, thumbRect, thumbnail);
+}
+
+static void DrawHoverPreview(HDC dc, HWND pagerWindow, int index)
+{
+    if (index < 0 || static_cast<size_t>(index) >= g_state.ids.size())
+    {
+        return;
+    }
+
+    RECT preview = HoverPreviewRect(pagerWindow, index);
+    StrokeRoundedRect(dc, preview, DpiScale(pagerWindow, 4), RGB(64, 156, 255), DpiScale(pagerWindow, 1));
+
+    RECT content{
+        preview.left + DpiScale(pagerWindow, 6),
+        preview.top + DpiScale(pagerWindow, 6),
+        preview.right - DpiScale(pagerWindow, 6),
+        preview.bottom - DpiScale(pagerWindow, 6)};
+
+    HBITMAP thumbnail = static_cast<size_t>(index) < g_state.thumbnails.size() ? g_state.thumbnails[index] : nullptr;
+    if (!DrawBitmapScaled(dc, content, thumbnail))
+    {
+        HWND appWindow = static_cast<size_t>(index) < g_state.foregroundWindows.size() ? g_state.foregroundWindows[index] : nullptr;
+        DrawDesktopIcon(dc, pagerWindow, content, appWindow, index == g_state.currentIndex);
+    }
 }
 
 static COLORREF NudgeTaskbarColor(COLORREF color)
@@ -1043,36 +1356,49 @@ static void RenderPager(HWND window)
         return;
     }
 
-    HDC windowDc = GetDC(window);
-    HDC memoryDc = CreateCompatibleDC(windowDc);
-    HBITMAP bitmap = CreateCompatibleBitmap(windowDc, width, height);
+    BITMAPINFO bitmapInfo{};
+    bitmapInfo.bmiHeader.biSize = sizeof(bitmapInfo.bmiHeader);
+    bitmapInfo.bmiHeader.biWidth = width;
+    bitmapInfo.bmiHeader.biHeight = -height;
+    bitmapInfo.bmiHeader.biPlanes = 1;
+    bitmapInfo.bmiHeader.biBitCount = 32;
+    bitmapInfo.bmiHeader.biCompression = BI_RGB;
+
+    unsigned char* pixels = nullptr;
+    HDC memoryDc = CreateCompatibleDC(nullptr);
+    HBITMAP bitmap = CreateDIBSection(memoryDc, &bitmapInfo, DIB_RGB_COLORS, reinterpret_cast<void**>(&pixels), nullptr, 0);
     if (bitmap == nullptr)
     {
         DeleteDC(memoryDc);
-        ReleaseDC(window, windowDc);
         return;
     }
 
     HGDIOBJ oldBitmap = SelectObject(memoryDc, bitmap);
 
-    HBRUSH transparentBrush = CreateSolidBrush(RGB(255, 0, 255));
+    COLORREF transparentColor = RGB(255, 0, 255);
+    HBRUSH transparentBrush = CreateSolidBrush(transparentColor);
     FillRect(memoryDc, &client, transparentBrush);
     DeleteObject(transparentBrush);
 
     COLORREF activeBar = RGB(0, 120, 212);
+    COLORREF hoverBar = RGB(64, 156, 255);
     COLORREF inactiveBar = RGB(120, 120, 120);
     COLORREF hitBackground = SampleTaskbarHitBackground(window);
+    COLORREF hoverBackground = Blend(hitBackground, RGB(0, 120, 212), 0.18);
+    int hoverIndex = (g_hoverIndex >= 0 && static_cast<size_t>(g_hoverIndex) < g_state.ids.size()) ? g_hoverIndex : -1;
+    int previewIndex = hoverIndex == g_state.currentIndex ? -1 : hoverIndex;
 
     for (int i = 0; i < static_cast<int>(g_state.ids.size()); ++i)
     {
         RECT rect = BlockRect(window, i);
         bool active = i == g_state.currentIndex;
+        bool hovered = i == hoverIndex;
 
         // A fully color-keyed card does not reliably receive mouse input.
         // Keep a near-transparent hit target that avoids the magenta color key.
-        if (active)
+        if (active || hovered)
         {
-            HBRUSH hitBrush = CreateSolidBrush(hitBackground);
+            HBRUSH hitBrush = CreateSolidBrush(hovered ? hoverBackground : hitBackground);
             FillRect(memoryDc, &rect, hitBrush);
             DeleteObject(hitBrush);
         }
@@ -1087,24 +1413,117 @@ static void RenderPager(HWND window)
             }
         }
 
-        int barWidth = DpiScale(window, active ? 30 : 18);
-        int barHeight = DpiScale(window, active ? 3 : 2);
+        if (hovered)
+        {
+            StrokeRoundedRect(memoryDc, rect, DpiScale(window, 3), hoverBar, DpiScale(window, 1));
+        }
+
+        int barWidth = DpiScale(window, (active || hovered) ? 30 : 18);
+        int barHeight = DpiScale(window, (active || hovered) ? 3 : 2);
         int barX = rect.left + ((rect.right - rect.left) - barWidth) / 2;
         RECT bar{
             barX,
             rect.bottom - DpiScale(window, 4),
             barX + barWidth,
             rect.bottom - DpiScale(window, 4) + barHeight};
-        HBRUSH barBrush = CreateSolidBrush(active ? activeBar : inactiveBar);
+        HBRUSH barBrush = CreateSolidBrush(active ? activeBar : (hovered ? hoverBar : inactiveBar));
         FillRect(memoryDc, &bar, barBrush);
         DeleteObject(barBrush);
     }
 
-    BitBlt(windowDc, 0, 0, width, height, memoryDc, 0, 0, SRCCOPY);
+    DrawHoverPreview(memoryDc, window, previewIndex);
+
+    if (pixels != nullptr)
+    {
+        ApplyColorKeyAlpha(pixels, width, height, transparentColor);
+        for (int i = 0; i < static_cast<int>(g_state.ids.size()); ++i)
+        {
+            EnsureMinimumAlphaInRect(pixels, width, height, BlockRect(window, i), hitBackground, 1);
+        }
+    }
+
+    RECT windowRect{};
+    GetWindowRect(window, &windowRect);
+    POINT destination{windowRect.left, windowRect.top};
+    POINT source{0, 0};
+    SIZE size{width, height};
+    BLENDFUNCTION blend{};
+    blend.BlendOp = AC_SRC_OVER;
+    blend.SourceConstantAlpha = 255;
+    blend.AlphaFormat = AC_SRC_ALPHA;
+    UpdateLayeredWindow(window, nullptr, &destination, &size, memoryDc, &source, 0, &blend, ULW_ALPHA);
+
     SelectObject(memoryDc, oldBitmap);
     DeleteObject(bitmap);
     DeleteDC(memoryDc);
-    ReleaseDC(window, windowDc);
+}
+
+static void RemoveTrayIcon(HWND window)
+{
+    if (!g_trayIconAdded)
+    {
+        return;
+    }
+
+    NOTIFYICONDATAW data{};
+    data.cbSize = sizeof(data);
+    data.hWnd = window;
+    data.uID = TrayIconId;
+    Shell_NotifyIconW(NIM_DELETE, &data);
+    g_trayIconAdded = false;
+}
+
+static bool AddTrayIcon(HWND window)
+{
+    NOTIFYICONDATAW data{};
+    data.cbSize = sizeof(data);
+    data.hWnd = window;
+    data.uID = TrayIconId;
+    data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    data.uCallbackMessage = WM_TRAYICON;
+    data.hIcon = LoadIconW(nullptr, MAKEINTRESOURCEW(32512));
+    wcscpy_s(data.szTip, L"WorkspacePagerMvp");
+
+    g_trayIconAdded = Shell_NotifyIconW(NIM_ADD, &data) != FALSE;
+    Log("Add tray icon ok=%d err=%lu", g_trayIconAdded ? 1 : 0, GetLastError());
+    return g_trayIconAdded;
+}
+
+static void ShowTrayContextMenu(HWND window)
+{
+    POINT screenPoint{};
+    if (!GetCursorPos(&screenPoint))
+    {
+        return;
+    }
+
+    HMENU menu = CreatePopupMenu();
+    if (menu == nullptr)
+    {
+        return;
+    }
+
+    AppendMenuW(menu, MF_STRING | MF_GRAYED, TrayMenuSettingsCommand, L"设置");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, TrayMenuExitCommand, L"退出");
+
+    SetForegroundWindow(window);
+    UINT command = TrackPopupMenu(
+        menu,
+        TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
+        screenPoint.x,
+        screenPoint.y,
+        0,
+        window,
+        nullptr);
+    DestroyMenu(menu);
+    PostMessageW(window, WM_NULL, 0, 0);
+
+    if (command == TrayMenuExitCommand)
+    {
+        Log("Exit requested from tray menu");
+        DestroyWindow(window);
+    }
 }
 
 static LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
@@ -1121,6 +1540,17 @@ static LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPA
             RefreshCurrentForegroundWindow();
             RepositionOverlay(window);
             RenderPager(window);
+        }
+        else if (wParam == TaskbarRefreshTimerId)
+        {
+            KillTimer(window, TaskbarRefreshTimerId);
+            RepositionOverlay(window);
+            RenderPager(window);
+            if (g_taskbarRefreshBurstsRemaining > 0)
+            {
+                --g_taskbarRefreshBurstsRemaining;
+                SetTimer(window, TaskbarRefreshTimerId, TaskbarRefreshBurstDelayMs, nullptr);
+            }
         }
         else if (wParam == DesktopRefreshTimerId)
         {
@@ -1152,6 +1582,19 @@ static LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPA
         }
         return 0;
 
+    case WM_TASKBAR_REFRESH:
+        if (wParam != 0)
+        {
+            ScheduleTaskbarRefresh(1, 15);
+            RepositionOverlay(window);
+            RenderPager(window);
+        }
+        else
+        {
+            ScheduleTaskbarRefresh();
+        }
+        return 0;
+
     case WM_VD_CHANGED:
         if (wParam == VdChangedSwitch)
         {
@@ -1167,17 +1610,50 @@ static LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPA
         }
         return 0;
 
+    case WM_TRAYICON:
+        if (wParam == TrayIconId && (lParam == WM_RBUTTONUP || lParam == WM_CONTEXTMENU))
+        {
+            ShowTrayContextMenu(window);
+        }
+        return 0;
+
+    case WM_MOUSEMOVE:
+    {
+        if (!g_trackingMouse)
+        {
+            TRACKMOUSEEVENT track{};
+            track.cbSize = sizeof(track);
+            track.dwFlags = TME_LEAVE;
+            track.hwndTrack = window;
+            g_trackingMouse = TrackMouseEvent(&track) != FALSE;
+        }
+
+        POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        int hoverIndex = HitTestDesktopIndex(window, point);
+        if (hoverIndex != g_hoverIndex)
+        {
+            g_hoverIndex = hoverIndex;
+            RenderPager(window);
+        }
+        return 0;
+    }
+
+    case WM_MOUSELEAVE:
+        g_trackingMouse = false;
+        if (g_hoverIndex != -1)
+        {
+            g_hoverIndex = -1;
+            RenderPager(window);
+        }
+        return 0;
+
     case WM_LBUTTONUP:
     {
         POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
-        for (int i = 0; i < static_cast<int>(g_state.ids.size()); ++i)
+        int target = HitTestDesktopIndex(window, point);
+        if (target >= 0)
         {
-            RECT rect = BlockRect(window, i);
-            if (PtInRect(&rect, point))
-            {
-                SwitchToDesktop(i);
-                return 0;
-            }
+            SwitchToDesktop(target);
         }
         return 0;
     }
@@ -1211,10 +1687,13 @@ static LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPA
         return 0;
 
     case WM_DESTROY:
+        UnregisterTaskbarEventHook();
+        RemoveTrayIcon(window);
         KillTimer(window, RepositionTimerId);
         KillTimer(window, DesktopRefreshTimerId);
         KillTimer(window, ForegroundRefreshTimerId);
         KillTimer(window, SwitchRefreshTimerId);
+        KillTimer(window, TaskbarRefreshTimerId);
         PostQuitMessage(0);
         return 0;
     }
@@ -1237,6 +1716,8 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int)
 
     g_keyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, GetModuleHandleW(nullptr), 0);
     Log("Keyboard hook hwnd=0x%p err=%lu", g_keyboardHook, GetLastError());
+    g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, LowLevelMouseProc, GetModuleHandleW(nullptr), 0);
+    Log("Mouse hook hwnd=0x%p err=%lu", g_mouseHook, GetLastError());
 
     WNDCLASSEXW wc{};
     wc.cbSize = sizeof(wc);
@@ -1267,9 +1748,9 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int)
         style,
         0,
         0,
-        PagerWidth(nullptr),
-        32,
-        nullptr,
+        OverlayWidth(nullptr),
+        OverlayHeight(nullptr, DpiScale(nullptr, 40)),
+        g_taskbar,
         nullptr,
         instance,
         nullptr);
@@ -1282,9 +1763,8 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int)
         return 1;
     }
 
-    HWND oldParent = SetParent(g_window, g_taskbar);
-    Log("SetParent old=0x%p err=%lu", oldParent, GetLastError());
-    SetLayeredWindowAttributes(g_window, RGB(255, 0, 255), 0, LWA_COLORKEY);
+    AddTrayIcon(g_window);
+    RegisterTaskbarEventHook();
     RepositionOverlay(g_window);
     RenderPager(g_window);
     ShowWindow(g_window, SW_SHOWNOACTIVATE);
@@ -1302,6 +1782,11 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int)
     {
         UnhookWindowsHookEx(g_keyboardHook);
         g_keyboardHook = nullptr;
+    }
+    if (g_mouseHook != nullptr)
+    {
+        UnhookWindowsHookEx(g_mouseHook);
+        g_mouseHook = nullptr;
     }
     CoUninitialize();
     Log("Exiting WorkspacePagerMvp");

@@ -1,6 +1,8 @@
+
 param(
     [string]$Output = "WorkspacePagerMvp.exe"
 )
+taskkill /IM WorkspacePagerMvp.exe /F 
 
 $ErrorActionPreference = "Stop"
 
