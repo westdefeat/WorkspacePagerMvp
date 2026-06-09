@@ -1,5 +1,7 @@
 #include "AppShared.h"
 
+static const DWORD OverlayPositionLongPressMs = 350;
+
 static LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
 {
     switch (message)
@@ -134,6 +136,30 @@ static LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPA
         }
 
         POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        if (g_overlayRightButtonDown)
+        {
+            POINT screenPoint = point;
+            ClientToScreen(window, &screenPoint);
+
+            if (!g_overlayPositionDragActive && GetTickCount() - g_overlayRightButtonDownTick >= OverlayPositionLongPressMs)
+            {
+                g_overlayPositionDragActive = true;
+                if (g_hoverIndex != -1)
+                {
+                    g_hoverIndex = -1;
+                    RenderPager(window);
+                }
+                Log("Overlay position drag begin startX=%d", g_overlayPositionDragStartX);
+            }
+
+            if (g_overlayPositionDragActive)
+            {
+                int deltaX = screenPoint.x - g_overlayPositionDragStart.x;
+                MoveOverlayHorizontally(window, g_overlayPositionDragStartX + deltaX);
+                return 0;
+            }
+        }
+
         int hoverIndex = HitTestDesktopIndex(window, point);
         if (hoverIndex != g_hoverIndex)
         {
@@ -142,6 +168,40 @@ static LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPA
         }
         return 0;
     }
+
+    case WM_RBUTTONDOWN:
+    {
+        POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        ClientToScreen(window, &point);
+
+        RECT windowRect{};
+        GetWindowRect(window, &windowRect);
+        g_overlayRightButtonDown = true;
+        g_overlayPositionDragActive = false;
+        g_overlayPositionDragStart = point;
+        g_overlayPositionDragStartX = windowRect.left;
+        g_overlayRightButtonDownTick = GetTickCount();
+        SetCapture(window);
+        return 0;
+    }
+
+    case WM_RBUTTONUP:
+        if (g_overlayPositionDragActive)
+        {
+            Log("Overlay position drag end offsetX=%d", g_overlayManualOffsetX);
+        }
+        g_overlayRightButtonDown = false;
+        g_overlayPositionDragActive = false;
+        if (GetCapture() == window)
+        {
+            ReleaseCapture();
+        }
+        return 0;
+
+    case WM_CAPTURECHANGED:
+        g_overlayRightButtonDown = false;
+        g_overlayPositionDragActive = false;
+        return 0;
 
     case WM_MOUSELEAVE:
         g_trackingMouse = false;

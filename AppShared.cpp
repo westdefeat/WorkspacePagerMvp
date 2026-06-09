@@ -24,6 +24,12 @@ POINT g_dragStartPoint{};
 POINT g_dragDropPoint{};
 int g_dragDropTarget = -1;
 DWORD g_suppressPagerClickUntil = 0;
+int g_overlayManualOffsetX = 0;
+bool g_overlayRightButtonDown = false;
+bool g_overlayPositionDragActive = false;
+POINT g_overlayPositionDragStart{};
+int g_overlayPositionDragStartX = 0;
+DWORD g_overlayRightButtonDownTick = 0;
 
 GUID g_pendingDesktopId{};
 bool g_hasPendingDesktopSwitch = false;

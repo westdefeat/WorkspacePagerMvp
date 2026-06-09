@@ -62,6 +62,12 @@ extern POINT g_dragStartPoint;
 extern POINT g_dragDropPoint;
 extern int g_dragDropTarget;
 extern DWORD g_suppressPagerClickUntil;
+extern int g_overlayManualOffsetX;
+extern bool g_overlayRightButtonDown;
+extern bool g_overlayPositionDragActive;
+extern POINT g_overlayPositionDragStart;
+extern int g_overlayPositionDragStartX;
+extern DWORD g_overlayRightButtonDownTick;
 extern GUID g_pendingDesktopId;
 extern bool g_hasPendingDesktopSwitch;
 
@@ -81,6 +87,7 @@ int HitTestDesktopIndex(HWND window, POINT point);
 int HitTestDesktopDropIndexFromScreen(HWND window, POINT point);
 void LogDropHitTestMiss(HWND window, POINT point);
 void RepositionOverlay(HWND window);
+void MoveOverlayHorizontally(HWND window, int desiredX);
 
 int FindDesktopIndexById(const GUID& id);
 int GetCurrentDesktopIndexFromRegistry();

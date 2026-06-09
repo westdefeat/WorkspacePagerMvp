@@ -252,12 +252,28 @@ void LogDropHitTestMiss(HWND window, POINT point)
     }
 }
 
-void RepositionOverlay(HWND window)
+struct OverlayPlacement
+{
+    int baseX = 0;
+    int x = 0;
+    int y = 0;
+    int width = 0;
+    int height = 0;
+};
+
+static int ClampOverlayX(const RECT& taskbarRect, int width, int x, int margin)
+{
+    int minX = taskbarRect.left + margin;
+    int maxX = max(minX, taskbarRect.right - width - margin);
+    return min(max(x, minX), maxX);
+}
+
+static bool CalculateOverlayPlacement(HWND window, OverlayPlacement& placement)
 {
     g_taskbar = FindWindowW(L"Shell_TrayWnd", nullptr);
     if (g_taskbar == nullptr)
     {
-        return;
+        return false;
     }
 
     g_tray = FindWindowExW(g_taskbar, nullptr, L"TrayNotifyWnd", nullptr);
@@ -266,19 +282,74 @@ void RepositionOverlay(HWND window)
     RECT trayRect{};
     if (!GetWindowRect(g_taskbar, &taskbarRect))
     {
-        return;
+        return false;
     }
 
-    GetWindowRect(g_tray, &trayRect);
+    if (g_tray != nullptr)
+    {
+        GetWindowRect(g_tray, &trayRect);
+    }
     int taskbarWidth = taskbarRect.right - taskbarRect.left;
     int taskbarHeight = taskbarRect.bottom - taskbarRect.top;
     int width = OverlayWidth(window);
     int height = OverlayHeight(window, taskbarHeight);
     int trayLeft = g_tray == nullptr ? taskbarWidth - DpiScale(window, 96) : trayRect.left - taskbarRect.left;
-    int x = taskbarRect.left + max(DpiScale(window, 8), trayLeft - width - DpiScale(window, 8));
-    int y = taskbarRect.bottom - height;
+    int margin = DpiScale(window, 8);
+    int baseX = taskbarRect.left + max(margin, trayLeft - width - margin);
 
-    SetWindowPos(window, HWND_TOPMOST, x, y, width, height, SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
+    placement.baseX = ClampOverlayX(taskbarRect, width, baseX, margin);
+    placement.x = ClampOverlayX(taskbarRect, width, placement.baseX + g_overlayManualOffsetX, margin);
+    placement.y = taskbarRect.bottom - height;
+    placement.width = width;
+    placement.height = height;
+    g_overlayManualOffsetX = placement.x - placement.baseX;
+    return true;
+}
+
+void RepositionOverlay(HWND window)
+{
+    OverlayPlacement placement{};
+    if (!CalculateOverlayPlacement(window, placement))
+    {
+        return;
+    }
+
+    SetWindowPos(
+        window,
+        HWND_TOPMOST,
+        placement.x,
+        placement.y,
+        placement.width,
+        placement.height,
+        SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
+}
+
+void MoveOverlayHorizontally(HWND window, int desiredX)
+{
+    OverlayPlacement placement{};
+    if (!CalculateOverlayPlacement(window, placement))
+    {
+        return;
+    }
+
+    RECT taskbarRect{};
+    if (!GetWindowRect(g_taskbar, &taskbarRect))
+    {
+        return;
+    }
+
+    int margin = DpiScale(window, 8);
+    placement.x = ClampOverlayX(taskbarRect, placement.width, desiredX, margin);
+    g_overlayManualOffsetX = placement.x - placement.baseX;
+
+    SetWindowPos(
+        window,
+        HWND_TOPMOST,
+        placement.x,
+        placement.y,
+        placement.width,
+        placement.height,
+        SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
 }
 
 static bool IsTaskbarRelatedWindow(HWND window)
