@@ -16,11 +16,13 @@ static const GUID IID_IVirtualDesktopManager = {0xA5CD92FF, 0x29BE, 0x454C, {0x8
 static const GUID IID_IVirtualDesktopNotificationService = {0x0CD45E71, 0xD927, 0x4F15, {0x8B, 0x0A, 0x8F, 0xEF, 0x52, 0x53, 0x37, 0xBF}};
 static const GUID IID_IVirtualDesktopNotification = {0xB9E5E94D, 0x233E, 0x49AB, {0xAF, 0x5C, 0x2B, 0x45, 0x41, 0xC3, 0xAA, 0xDE}};
 static const GUID IID_IVirtualDesktop = {0x3F07F4BE, 0xB107, 0x441A, {0xAF, 0x0F, 0x39, 0xD8, 0x25, 0x29, 0x07, 0x2C}};
+static const GUID IID_IApplicationViewCollection = {0x1841C6D7, 0x4F9D, 0x42C0, {0xAF, 0x41, 0x87, 0x47, 0x53, 0x8F, 0x10, 0xE5}};
 
 static const wchar_t* WindowClassName = L"WorkspacePagerMvpWindow";
 static const UINT WM_VD_CHANGED = WM_APP + 1;
 static const UINT WM_TRAYICON = WM_APP + 2;
 static const UINT WM_TASKBAR_REFRESH = WM_APP + 3;
+static const UINT WM_DRAGGED_WINDOW_DROPPED = WM_APP + 4;
 static const WPARAM VdChangedRefresh = 0;
 static const WPARAM VdChangedSwitch = 1;
 static const UINT_PTR RepositionTimerId = 1;
@@ -54,7 +56,7 @@ struct IVirtualDesktopManagerInternal : IUnknown
 {
     virtual int STDMETHODCALLTYPE GetCount() = 0;
     virtual HRESULT STDMETHODCALLTYPE MoveViewToDesktop(IUnknown* view, IVirtualDesktop* desktop) = 0;
-    virtual BOOL STDMETHODCALLTYPE CanViewMoveDesktops(IUnknown* view) = 0;
+    virtual HRESULT STDMETHODCALLTYPE CanViewMoveDesktops(IUnknown* view, BOOL* canMove) = 0;
     virtual IVirtualDesktop* STDMETHODCALLTYPE GetCurrentDesktop() = 0;
     virtual HRESULT STDMETHODCALLTYPE GetDesktops(IObjectArrayProbe** desktops) = 0;
     virtual HRESULT STDMETHODCALLTYPE GetAdjacentDesktop(IVirtualDesktop* from, int direction, IVirtualDesktop** desktop) = 0;
@@ -81,6 +83,14 @@ struct IVirtualDesktopManager : IUnknown
     virtual BOOL STDMETHODCALLTYPE IsWindowOnCurrentVirtualDesktop(HWND topLevelWindow) = 0;
     virtual HRESULT STDMETHODCALLTYPE GetWindowDesktopId(HWND topLevelWindow, GUID* desktopId) = 0;
     virtual HRESULT STDMETHODCALLTYPE MoveWindowToDesktop(HWND topLevelWindow, REFGUID desktopId) = 0;
+};
+
+struct IApplicationViewCollection : IUnknown
+{
+    virtual HRESULT STDMETHODCALLTYPE GetViews(IObjectArrayProbe** views) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetViewsByZOrder(IObjectArrayProbe** views) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetViewsByAppUserModelId(const wchar_t* appUserModelId, IObjectArrayProbe** views) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetViewForHwnd(HWND window, IUnknown** view) = 0;
 };
 
 struct IVirtualDesktopNotification : IUnknown
@@ -121,6 +131,7 @@ static HWINEVENTHOOK g_taskbarEventHook = nullptr;
 static IServiceProvider* g_shell = nullptr;
 static IVirtualDesktopManagerInternal* g_desktopManager = nullptr;
 static IVirtualDesktopManager* g_publicDesktopManager = nullptr;
+static IApplicationViewCollection* g_applicationViews = nullptr;
 static IVirtualDesktopNotificationService* g_notificationService = nullptr;
 static DWORD g_notificationCookie = 0;
 static DesktopState g_state;
@@ -130,6 +141,14 @@ static int g_hoverIndex = -1;
 static int g_taskbarRefreshBurstsRemaining = 0;
 static bool g_trackingMouse = false;
 static bool g_trayIconAdded = false;
+static HWND g_dragCandidateWindow = nullptr;
+static POINT g_dragStartPoint{};
+static POINT g_dragDropPoint{};
+static int g_dragDropTarget = -1;
+static DWORD g_suppressPagerClickUntil = 0;
+
+GUID g_pendingDesktopId{};
+bool g_hasPendingDesktopSwitch = false;
 static void Log(const char* format, ...)
 {
     FILE* log = nullptr;
@@ -145,14 +164,6 @@ static void Log(const char* format, ...)
     fprintf(log, "\n");
     va_end(args);
     fclose(log);
-}
-
-static COLORREF Blend(COLORREF from, COLORREF to, double t)
-{
-    int r = static_cast<int>(GetRValue(from) + (GetRValue(to) - GetRValue(from)) * t);
-    int g = static_cast<int>(GetGValue(from) + (GetGValue(to) - GetGValue(from)) * t);
-    int b = static_cast<int>(GetBValue(from) + (GetBValue(to) - GetBValue(from)) * t);
-    return RGB(r, g, b);
 }
 
 static LONG WINAPI UnhandledExceptionHandler(EXCEPTION_POINTERS* exceptionInfo)
@@ -172,6 +183,24 @@ static LONG WINAPI UnhandledExceptionHandler(EXCEPTION_POINTERS* exceptionInfo)
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
+static void ConfigureDpiAwareness()
+{
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    if (user32 == nullptr)
+    {
+        return;
+    }
+
+    typedef BOOL(WINAPI* SetProcessDpiAwarenessContextProc)(DPI_AWARENESS_CONTEXT);
+    SetProcessDpiAwarenessContextProc setProcessDpiAwarenessContext =
+        reinterpret_cast<SetProcessDpiAwarenessContextProc>(GetProcAddress(user32, "SetProcessDpiAwarenessContext"));
+    if (setProcessDpiAwarenessContext != nullptr)
+    {
+        BOOL ok = setProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        Log("SetProcessDpiAwarenessContext ok=%d err=%lu", ok ? 1 : 0, GetLastError());
+    }
+}
+
 static void ReleaseUnknown(IUnknown* object)
 {
     if (object != nullptr)
@@ -185,6 +214,7 @@ static int HoverPreviewContentWidth(HWND window);
 static int HoverPreviewContentHeight(HWND window);
 static RECT BlockRect(HWND window, int index);
 static RECT HoverPreviewRect(HWND window, int index);
+static void RenderPager(HWND window);
 
 static IVirtualDesktop* GetDesktopAt(UINT index)
 {
@@ -267,6 +297,49 @@ static void ClearThumbnails(std::vector<HBITMAP>& thumbnails)
     thumbnails.clear();
 }
 
+static void ClearThumbnailForDesktop(int index)
+{
+    if (index < 0 || static_cast<size_t>(index) >= g_state.thumbnails.size())
+    {
+        return;
+    }
+
+    if (g_state.thumbnails[index] != nullptr)
+    {
+        DeleteObject(g_state.thumbnails[index]);
+        g_state.thumbnails[index] = nullptr;
+    }
+}
+
+static void ClearCurrentDesktopThumbnail()
+{
+    ClearThumbnailForDesktop(g_state.currentIndex);
+}
+
+static bool SyncCurrentDesktopIndex(const char* reason)
+{
+    if (GetTickCount() < g_ignoreSwitchEventsUntil)
+    {
+        ClearCurrentDesktopThumbnail();
+        return false;
+    }
+
+    int currentIndex = GetCurrentDesktopIndexFromRegistry();
+    if (currentIndex < 0 || static_cast<size_t>(currentIndex) >= g_state.ids.size())
+    {
+        ClearCurrentDesktopThumbnail();
+        return false;
+    }
+
+    if (currentIndex != g_state.currentIndex)
+    {
+        Log("Current desktop sync %s old=%d new=%d", reason, g_state.currentIndex, currentIndex);
+        g_state.currentIndex = currentIndex;
+    }
+    ClearCurrentDesktopThumbnail();
+    return true;
+}
+
 static bool IsAppWindow(HWND window)
 {
     if (window == nullptr || window == g_window || !IsWindowVisible(window))
@@ -328,6 +401,12 @@ static void RefreshDesktopState()
 {
     DesktopState next;
 
+    GUID oldCurrentId{};
+    if (g_state.currentIndex >= 0 && static_cast<size_t>(g_state.currentIndex) < g_state.ids.size())
+    {
+        oldCurrentId = g_state.ids[g_state.currentIndex];
+    }
+
     if (g_desktopManager != nullptr)
     {
         IObjectArrayProbe* desktops = nullptr;
@@ -352,7 +431,15 @@ static void RefreshDesktopState()
 
         if (!next.ids.empty())
         {
-            next.currentIndex = min(g_state.currentIndex, static_cast<int>(next.ids.size()) - 1);
+            int newIndex = FindDesktopIndexIn(next.ids, oldCurrentId);
+            if (newIndex >= 0)
+            {
+                next.currentIndex = newIndex;
+            }
+            else
+            {
+                next.currentIndex = min(g_state.currentIndex, static_cast<int>(next.ids.size()) - 1);
+            }
         }
     }
 
@@ -375,6 +462,7 @@ static void RefreshDesktopState()
     }
     ClearThumbnails(g_state.thumbnails);
     g_state = next;
+    SyncCurrentDesktopIndex("desktop refresh");
 
     HWND foreground = GetForegroundWindow();
     AssignForegroundWindowForDesktop(foreground);
@@ -383,6 +471,7 @@ static void RefreshDesktopState()
 
 static void RefreshCurrentForegroundWindow()
 {
+    SyncCurrentDesktopIndex("foreground refresh");
     if (g_state.currentIndex < 0 || static_cast<size_t>(g_state.currentIndex) >= g_state.foregroundWindows.size())
     {
         return;
@@ -403,9 +492,13 @@ static void ScheduleForegroundRefresh(HWND window, UINT delayMs = 250)
     }
 }
 
-static void CaptureThumbnailForDesktop(int index)
+static void CaptureThumbnailForDesktop(int index, bool allowCurrentDesktop = false, const char* reason = "unknown")
 {
     if (index < 0 || static_cast<size_t>(index) >= g_state.thumbnails.size() || g_window == nullptr)
+    {
+        return;
+    }
+    if (index == g_state.currentIndex && !allowCurrentDesktop)
     {
         return;
     }
@@ -467,12 +560,21 @@ static void CaptureThumbnailForDesktop(int index)
         return;
     }
 
-    if (g_state.thumbnails[index] != nullptr)
+    bool replacedExisting = g_state.thumbnails[index] != nullptr;
+    if (replacedExisting)
     {
         DeleteObject(g_state.thumbnails[index]);
     }
     g_state.thumbnails[index] = bitmap;
-    Log("Captured thumbnail index=%d size=%dx%d", index, thumbWidth, thumbHeight);
+    Log(
+        "Thumbnail updated reason=%s target=%d current=%d replaced=%d foreground=0x%p size=%dx%d",
+        reason,
+        index,
+        g_state.currentIndex,
+        replacedExisting ? 1 : 0,
+        GetForegroundWindow(),
+        thumbWidth,
+        thumbHeight);
 }
 
 static LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lParam)
@@ -489,11 +591,26 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lPa
 
         static DWORD lastCaptureTick = 0;
         DWORD now = GetTickCount();
-        if (arrow && ctrl && win && now - lastCaptureTick > 150)
+        int targetIndex = -1;
+        if (keyboard != nullptr && keyboard->vkCode == VK_LEFT)
+        {
+            targetIndex = g_state.currentIndex - 1;
+        }
+        else if (keyboard != nullptr && keyboard->vkCode == VK_RIGHT)
+        {
+            targetIndex = g_state.currentIndex + 1;
+        }
+
+        if (arrow &&
+            ctrl &&
+            win &&
+            targetIndex >= 0 &&
+            targetIndex < static_cast<int>(g_state.ids.size()) &&
+            now - lastCaptureTick > 150)
         {
             lastCaptureTick = now;
             Log("Keyboard pre-switch capture current=%d", g_state.currentIndex);
-            CaptureThumbnailForDesktop(g_state.currentIndex);
+            CaptureThumbnailForDesktop(g_state.currentIndex, true, "keyboard-pre-switch");
         }
     }
 
@@ -636,6 +753,317 @@ static int HitTestDesktopIndex(HWND window, POINT point)
     return -1;
 }
 
+static int HitTestDesktopIndexFromScreen(HWND window, POINT point)
+{
+    if (window == nullptr || !IsWindow(window))
+    {
+        return -1;
+    }
+
+    POINT clientPoint = point;
+    if (!ScreenToClient(window, &clientPoint))
+    {
+        return -1;
+    }
+
+    return HitTestDesktopIndex(window, clientPoint);
+}
+
+static int HitTestDesktopDropIndex(HWND window, POINT point)
+{
+    int index = HitTestDesktopIndex(window, point);
+    if (index >= 0)
+    {
+        return index;
+    }
+
+    for (int i = 0; i < static_cast<int>(g_state.ids.size()); ++i)
+    {
+        RECT block = BlockRect(window, i);
+        InflateRect(&block, DpiScale(window, 8), DpiScale(window, 10));
+        if (PtInRect(&block, point))
+        {
+            return i;
+        }
+
+        RECT preview = HoverPreviewRect(window, i);
+        if (PtInRect(&preview, point))
+        {
+            return i;
+        }
+    }
+
+    return -1;
+}
+
+static RECT ClientRectToScreenRect(HWND window, RECT rect)
+{
+    POINT topLeft{rect.left, rect.top};
+    POINT bottomRight{rect.right, rect.bottom};
+    ClientToScreen(window, &topLeft);
+    ClientToScreen(window, &bottomRight);
+    return RECT{topLeft.x, topLeft.y, bottomRight.x, bottomRight.y};
+}
+
+static int HitTestDesktopDropIndexFromScreen(HWND window, POINT point)
+{
+    if (window == nullptr || !IsWindow(window))
+    {
+        return -1;
+    }
+
+    for (int i = 0; i < static_cast<int>(g_state.ids.size()); ++i)
+    {
+        RECT block = ClientRectToScreenRect(window, BlockRect(window, i));
+        InflateRect(&block, DpiScale(window, 12), DpiScale(window, 14));
+        if (PtInRect(&block, point))
+        {
+            return i;
+        }
+
+        RECT preview = ClientRectToScreenRect(window, HoverPreviewRect(window, i));
+        if (PtInRect(&preview, point))
+        {
+            return i;
+        }
+    }
+
+    return -1;
+}
+
+static void LogDropHitTestMiss(HWND window, POINT point)
+{
+    RECT windowRect{};
+    RECT client{};
+    GetWindowRect(window, &windowRect);
+    GetClientRect(window, &client);
+    Log(
+        "Drop hit miss point=(%ld,%ld) window=(%ld,%ld,%ld,%ld) client=(%ld,%ld,%ld,%ld) desktops=%zu",
+        point.x,
+        point.y,
+        windowRect.left,
+        windowRect.top,
+        windowRect.right,
+        windowRect.bottom,
+        client.left,
+        client.top,
+        client.right,
+        client.bottom,
+        g_state.ids.size());
+
+    for (int i = 0; i < static_cast<int>(g_state.ids.size()); ++i)
+    {
+        RECT block = ClientRectToScreenRect(window, BlockRect(window, i));
+        RECT preview = ClientRectToScreenRect(window, HoverPreviewRect(window, i));
+        Log(
+            "Drop rect index=%d block=(%ld,%ld,%ld,%ld) preview=(%ld,%ld,%ld,%ld)",
+            i,
+            block.left,
+            block.top,
+            block.right,
+            block.bottom,
+            preview.left,
+            preview.top,
+            preview.right,
+            preview.bottom);
+    }
+}
+
+static HWND AppWindowFromPoint(POINT point)
+{
+    HWND hit = WindowFromPoint(point);
+    if (hit == nullptr)
+    {
+        return nullptr;
+    }
+
+    HWND root = GetAncestor(hit, GA_ROOT);
+    if (root != nullptr)
+    {
+        hit = root;
+    }
+
+    return IsAppWindow(hit) ? hit : nullptr;
+}
+
+static bool IsDragDistance(POINT from, POINT to)
+{
+    int thresholdX = max(4, GetSystemMetrics(SM_CXDRAG));
+    int thresholdY = max(4, GetSystemMetrics(SM_CYDRAG));
+    return abs(to.x - from.x) >= thresholdX || abs(to.y - from.y) >= thresholdY;
+}
+
+static bool CenterWindowOnMonitor(HWND appWindow, POINT anchorPoint)
+{
+    if (appWindow == nullptr || !IsWindow(appWindow) || IsIconic(appWindow) || IsZoomed(appWindow))
+    {
+        return false;
+    }
+
+    RECT windowRect{};
+    if (!GetWindowRect(appWindow, &windowRect))
+    {
+        return false;
+    }
+
+    HMONITOR monitor = MonitorFromPoint(anchorPoint, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO monitorInfo{};
+    monitorInfo.cbSize = sizeof(monitorInfo);
+    if (monitor == nullptr || !GetMonitorInfoW(monitor, &monitorInfo))
+    {
+        return false;
+    }
+
+    RECT workArea = monitorInfo.rcWork;
+    int width = windowRect.right - windowRect.left;
+    int height = windowRect.bottom - windowRect.top;
+    int workWidth = workArea.right - workArea.left;
+    int workHeight = workArea.bottom - workArea.top;
+    if (width <= 0 || height <= 0 || workWidth <= 0 || workHeight <= 0)
+    {
+        return false;
+    }
+
+    int x = workArea.left + (workWidth - width) / 2;
+    int y = workArea.top + (workHeight - height) / 2;
+    x = max(workArea.left, min(x, workArea.right - width));
+    y = max(workArea.top, min(y, workArea.bottom - height));
+
+    BOOL ok = SetWindowPos(
+        appWindow,
+        nullptr,
+        x,
+        y,
+        0,
+        0,
+        SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOZORDER | SWP_NOSIZE);
+    Log(
+        "Center moved window hwnd=0x%p ok=%d from=(%ld,%ld,%ld,%ld) to=(%d,%d) work=(%ld,%ld,%ld,%ld) err=%lu",
+        appWindow,
+        ok ? 1 : 0,
+        windowRect.left,
+        windowRect.top,
+        windowRect.right,
+        windowRect.bottom,
+        x,
+        y,
+        workArea.left,
+        workArea.top,
+        workArea.right,
+        workArea.bottom,
+        GetLastError());
+    return ok != FALSE;
+}
+
+static bool MoveAppWindowToDesktop(HWND appWindow, int targetIndex)
+{
+    if (appWindow == nullptr ||
+        !IsWindow(appWindow) ||
+        !IsAppWindow(appWindow) ||
+        targetIndex < 0 ||
+        targetIndex >= static_cast<int>(g_state.ids.size()))
+    {
+        return false;
+    }
+
+    GUID sourceId{};
+    int sourceIndex = -1;
+    HRESULT sourceHr = g_publicDesktopManager != nullptr ? g_publicDesktopManager->GetWindowDesktopId(appWindow, &sourceId) : E_NOINTERFACE;
+    if (SUCCEEDED(sourceHr))
+    {
+        sourceIndex = FindDesktopIndexById(sourceId);
+        if (sourceIndex == targetIndex)
+        {
+            Log("Drop window ignored same desktop hwnd=0x%p target=%d", appWindow, targetIndex);
+            return false;
+        }
+    }
+
+    HRESULT hr = E_FAIL;
+    HRESULT viewHr = E_FAIL;
+    HRESULT canMoveHr = E_FAIL;
+    BOOL canMove = FALSE;
+    if (g_applicationViews != nullptr && g_desktopManager != nullptr)
+    {
+        IUnknown* view = nullptr;
+        Log("MoveViewToDesktop begin hwnd=0x%p target=%d", appWindow, targetIndex);
+        viewHr = g_applicationViews->GetViewForHwnd(appWindow, &view);
+        if (SUCCEEDED(viewHr) && view != nullptr)
+        {
+            IVirtualDesktop* targetDesktop = GetDesktopAt(static_cast<UINT>(targetIndex));
+            if (targetDesktop != nullptr)
+            {
+                canMoveHr = g_desktopManager->CanViewMoveDesktops(view, &canMove);
+                if (SUCCEEDED(canMoveHr) && canMove)
+                {
+                    hr = g_desktopManager->MoveViewToDesktop(view, targetDesktop);
+                }
+                else
+                {
+                    hr = canMoveHr;
+                }
+                targetDesktop->Release();
+            }
+            view->Release();
+        }
+    }
+
+    Log(
+        "MoveViewToDesktop hwnd=0x%p source=%d target=%d sourceHr=0x%08X viewHr=0x%08X canMove=%d canMoveHr=0x%08X hr=0x%08X",
+        appWindow,
+        sourceIndex,
+        targetIndex,
+        static_cast<unsigned>(sourceHr),
+        static_cast<unsigned>(viewHr),
+        canMove ? 1 : 0,
+        static_cast<unsigned>(canMoveHr),
+        static_cast<unsigned>(hr));
+    if (FAILED(hr) && g_publicDesktopManager != nullptr)
+    {
+        hr = g_publicDesktopManager->MoveWindowToDesktop(appWindow, g_state.ids[targetIndex]);
+        Log(
+            "MoveWindowToDesktop fallback hwnd=0x%p source=%d target=%d hr=0x%08X",
+            appWindow,
+            sourceIndex,
+            targetIndex,
+            static_cast<unsigned>(hr));
+    }
+    if (FAILED(hr))
+    {
+        return false;
+    }
+
+    CenterWindowOnMonitor(appWindow, g_dragDropPoint);
+
+    for (HWND& foregroundWindow : g_state.foregroundWindows)
+    {
+        if (foregroundWindow == appWindow)
+        {
+            foregroundWindow = nullptr;
+        }
+    }
+    if (static_cast<size_t>(targetIndex) < g_state.foregroundWindows.size())
+    {
+        g_state.foregroundWindows[targetIndex] = appWindow;
+    }
+
+    if (sourceIndex >= 0)
+    {
+        ClearThumbnailForDesktop(sourceIndex);
+    }
+    else
+    {
+        ClearCurrentDesktopThumbnail();
+    }
+    Log("Preserved target thumbnail after move target=%d source=%d", targetIndex, sourceIndex);
+
+    ScheduleForegroundRefresh(g_window, 150);
+    KillTimer(g_window, DesktopRefreshTimerId);
+    SetTimer(g_window, DesktopRefreshTimerId, 500, nullptr);
+    RenderPager(g_window);
+    return true;
+}
+
 static void RepositionOverlay(HWND window)
 {
     g_taskbar = FindWindowW(L"Shell_TrayWnd", nullptr);
@@ -743,13 +1171,55 @@ static void CALLBACK TaskbarEventProc(
 
 static LRESULT CALLBACK LowLevelMouseProc(int code, WPARAM wParam, LPARAM lParam)
 {
-    if (code == HC_ACTION &&
-        (wParam == WM_LBUTTONDOWN || wParam == WM_LBUTTONUP || wParam == WM_RBUTTONDOWN || wParam == WM_RBUTTONUP))
+    if (code == HC_ACTION)
     {
         MSLLHOOKSTRUCT* mouse = reinterpret_cast<MSLLHOOKSTRUCT*>(lParam);
-        if (mouse != nullptr && IsPointInTaskbarArea(mouse->pt) && g_window != nullptr)
+        if (mouse != nullptr)
         {
-            PostMessageW(g_window, WM_TASKBAR_REFRESH, 1, 0);
+            if (wParam == WM_LBUTTONDOWN)
+            {
+                g_dragCandidateWindow = AppWindowFromPoint(mouse->pt);
+                g_dragStartPoint = mouse->pt;
+                if (g_dragCandidateWindow != nullptr)
+                {
+                    Log("Drag candidate hwnd=0x%p start=(%ld,%ld)", g_dragCandidateWindow, mouse->pt.x, mouse->pt.y);
+                }
+            }
+            else if (wParam == WM_LBUTTONUP)
+            {
+                HWND draggedWindow = g_dragCandidateWindow;
+                g_dragCandidateWindow = nullptr;
+                int target = HitTestDesktopDropIndexFromScreen(g_window, mouse->pt);
+                Log(
+                    "Drag release hwnd=0x%p start=(%ld,%ld) end=(%ld,%ld) distance=%d target=%d",
+                    draggedWindow,
+                    g_dragStartPoint.x,
+                    g_dragStartPoint.y,
+                    mouse->pt.x,
+                    mouse->pt.y,
+                    draggedWindow != nullptr && IsDragDistance(g_dragStartPoint, mouse->pt) ? 1 : 0,
+                    target);
+                if (draggedWindow != nullptr && IsDragDistance(g_dragStartPoint, mouse->pt) && target < 0)
+                {
+                    LogDropHitTestMiss(g_window, mouse->pt);
+                }
+                if (draggedWindow != nullptr &&
+                    IsDragDistance(g_dragStartPoint, mouse->pt) &&
+                    target >= 0)
+                {
+                    g_dragDropPoint = mouse->pt;
+                    g_dragDropTarget = target;
+                    g_suppressPagerClickUntil = GetTickCount() + 300;
+                    PostMessageW(g_window, WM_DRAGGED_WINDOW_DROPPED, reinterpret_cast<WPARAM>(draggedWindow), 0);
+                }
+            }
+
+            if ((wParam == WM_LBUTTONDOWN || wParam == WM_LBUTTONUP || wParam == WM_RBUTTONDOWN || wParam == WM_RBUTTONUP) &&
+                IsPointInTaskbarArea(mouse->pt) &&
+                g_window != nullptr)
+            {
+                PostMessageW(g_window, WM_TASKBAR_REFRESH, 1, 0);
+            }
         }
     }
 
@@ -830,7 +1300,18 @@ public:
     HRESULT STDMETHODCALLTYPE VirtualDesktopMoved(IVirtualDesktop*, INT64, INT64) override { NotifyRefresh("Moved"); return S_OK; }
     HRESULT STDMETHODCALLTYPE VirtualDesktopNameChanged(IVirtualDesktop*, void*) override { Notify(); return S_OK; }
     HRESULT STDMETHODCALLTYPE ViewVirtualDesktopChanged(IUnknown*) override { return S_OK; }
-    HRESULT STDMETHODCALLTYPE CurrentVirtualDesktopChanged(IVirtualDesktop*, IVirtualDesktop*) override { NotifySwitch("CurrentChanged"); return S_OK; }
+    HRESULT STDMETHODCALLTYPE CurrentVirtualDesktopChanged(IVirtualDesktop* desktopOld, IVirtualDesktop* desktopNew) override
+    {
+        if (desktopNew != nullptr)
+        {
+            extern GUID g_pendingDesktopId;
+            extern bool g_hasPendingDesktopSwitch;
+            g_pendingDesktopId = desktopNew->GetId();
+            g_hasPendingDesktopSwitch = true;
+        }
+        NotifySwitch("CurrentChanged");
+        return S_OK;
+    }
     HRESULT STDMETHODCALLTYPE VirtualDesktopWallpaperChanged(IVirtualDesktop*, void*) override { return S_OK; }
     HRESULT STDMETHODCALLTYPE VirtualDesktopSwitched(IVirtualDesktop*, int) override { Log("VD event: Switched"); return S_OK; }
     HRESULT STDMETHODCALLTYPE RemoteVirtualDesktopConnected(IVirtualDesktop*) override { NotifyRefresh("RemoteConnected"); return S_OK; }
@@ -890,6 +1371,9 @@ static bool InitializeVirtualDesktop()
     hr = CoCreateInstance(CLSID_VirtualDesktopManager, nullptr, CLSCTX_INPROC_SERVER, IID_IVirtualDesktopManager, reinterpret_cast<void**>(&g_publicDesktopManager));
     Log("CoCreateInstance PublicDesktopManager hr=0x%08X", static_cast<unsigned>(hr));
 
+    hr = g_shell->QueryService(IID_IApplicationViewCollection, IID_IApplicationViewCollection, reinterpret_cast<void**>(&g_applicationViews));
+    Log("QueryService ApplicationViewCollection hr=0x%08X", static_cast<unsigned>(hr));
+
     hr = g_shell->QueryService(CLSID_VirtualNotificationService, IID_IVirtualDesktopNotificationService, reinterpret_cast<void**>(&g_notificationService));
     Log("QueryService NotificationService hr=0x%08X", static_cast<unsigned>(hr));
     if (SUCCEEDED(hr) && g_notificationService != nullptr)
@@ -909,6 +1393,7 @@ static bool InitializeVirtualDesktop()
     if (registryCurrentIndex >= 0)
     {
         g_state.currentIndex = registryCurrentIndex;
+        ClearCurrentDesktopThumbnail();
     }
     Log("Initial desktops=%zu current=%d", g_state.ids.size(), g_state.currentIndex);
     return true;
@@ -931,10 +1416,12 @@ static void ShutdownVirtualDesktop()
     }
 
     ReleaseUnknown(g_notificationService);
+    ReleaseUnknown(g_applicationViews);
     ReleaseUnknown(g_publicDesktopManager);
     ReleaseUnknown(g_desktopManager);
     ReleaseUnknown(g_shell);
     g_notificationService = nullptr;
+    g_applicationViews = nullptr;
     g_publicDesktopManager = nullptr;
     g_desktopManager = nullptr;
     g_shell = nullptr;
@@ -960,8 +1447,6 @@ static void SendVirtualDesktopShortcut(bool moveRight)
     SendKey(VK_CONTROL, true);
 }
 
-static void RenderPager(HWND window);
-
 static void SwitchToDesktop(int index)
 {
     if (index < 0 || index >= static_cast<int>(g_state.ids.size()) || index == g_state.currentIndex)
@@ -975,8 +1460,9 @@ static void SwitchToDesktop(int index)
         int delta = index - g_state.currentIndex;
         Log("Send Ctrl+Win+Arrow target=%d current=%d delta=%d", index, g_state.currentIndex, delta);
         RefreshCurrentForegroundWindow();
-        CaptureThumbnailForDesktop(g_state.currentIndex);
+        CaptureThumbnailForDesktop(g_state.currentIndex, true, "pager-switch");
         g_state.currentIndex = index;
+        ClearCurrentDesktopThumbnail();
         g_ignoreSwitchEventsUntil = GetTickCount() + static_cast<DWORD>(max(900, abs(delta) * 450));
         g_ignoreKeyboardCaptureUntil = GetTickCount() + static_cast<DWORD>(max(900, abs(delta) * 450));
         RenderPager(g_window);
@@ -1293,58 +1779,6 @@ static void DrawHoverPreview(HDC dc, HWND pagerWindow, int index)
     }
 }
 
-static COLORREF NudgeTaskbarColor(COLORREF color)
-{
-    int r = min(255, GetRValue(color) + 8);
-    int g = min(255, GetGValue(color) + 8);
-    int b = min(255, GetBValue(color) + 8);
-    COLORREF nudged = RGB(r, g, b);
-    return nudged == RGB(255, 0, 255) ? RGB(254, 0, 254) : nudged;
-}
-
-static COLORREF SampleTaskbarHitBackground(HWND window)
-{
-    RECT taskbarRect{};
-    RECT windowRect{};
-    if (!GetWindowRect(g_taskbar, &taskbarRect) || !GetWindowRect(window, &windowRect))
-    {
-        return RGB(245, 245, 245);
-    }
-
-    int midY = taskbarRect.top + (taskbarRect.bottom - taskbarRect.top) / 2;
-    POINT candidates[] = {
-        {windowRect.left - DpiScale(window, 6), midY},
-        {windowRect.right + DpiScale(window, 6), midY},
-        {taskbarRect.right - DpiScale(window, 12), midY},
-        {taskbarRect.left + DpiScale(window, 12), midY},
-    };
-
-    HDC screenDc = GetDC(nullptr);
-    if (screenDc == nullptr)
-    {
-        return RGB(245, 245, 245);
-    }
-
-    COLORREF color = RGB(245, 245, 245);
-    for (POINT point : candidates)
-    {
-        if (!PtInRect(&taskbarRect, point) || PtInRect(&windowRect, point))
-        {
-            continue;
-        }
-
-        COLORREF sampled = GetPixel(screenDc, point.x, point.y);
-        if (sampled != CLR_INVALID && sampled != RGB(255, 0, 255))
-        {
-            color = sampled;
-            break;
-        }
-    }
-
-    ReleaseDC(nullptr, screenDc);
-    return NudgeTaskbarColor(color);
-}
-
 static void RenderPager(HWND window)
 {
     RECT client{};
@@ -1355,6 +1789,7 @@ static void RenderPager(HWND window)
     {
         return;
     }
+    SyncCurrentDesktopIndex("render");
 
     BITMAPINFO bitmapInfo{};
     bitmapInfo.bmiHeader.biSize = sizeof(bitmapInfo.bmiHeader);
@@ -1383,8 +1818,7 @@ static void RenderPager(HWND window)
     COLORREF activeBar = RGB(0, 120, 212);
     COLORREF hoverBar = RGB(64, 156, 255);
     COLORREF inactiveBar = RGB(120, 120, 120);
-    COLORREF hitBackground = SampleTaskbarHitBackground(window);
-    COLORREF hoverBackground = Blend(hitBackground, RGB(0, 120, 212), 0.18);
+    COLORREF hitTestColor = RGB(1, 1, 1);
     int hoverIndex = (g_hoverIndex >= 0 && static_cast<size_t>(g_hoverIndex) < g_state.ids.size()) ? g_hoverIndex : -1;
     int previewIndex = hoverIndex == g_state.currentIndex ? -1 : hoverIndex;
 
@@ -1393,15 +1827,6 @@ static void RenderPager(HWND window)
         RECT rect = BlockRect(window, i);
         bool active = i == g_state.currentIndex;
         bool hovered = i == hoverIndex;
-
-        // A fully color-keyed card does not reliably receive mouse input.
-        // Keep a near-transparent hit target that avoids the magenta color key.
-        if (active || hovered)
-        {
-            HBRUSH hitBrush = CreateSolidBrush(hovered ? hoverBackground : hitBackground);
-            FillRect(memoryDc, &rect, hitBrush);
-            DeleteObject(hitBrush);
-        }
 
         if (!active)
         {
@@ -1438,7 +1863,7 @@ static void RenderPager(HWND window)
         ApplyColorKeyAlpha(pixels, width, height, transparentColor);
         for (int i = 0; i < static_cast<int>(g_state.ids.size()); ++i)
         {
-            EnsureMinimumAlphaInRect(pixels, width, height, BlockRect(window, i), hitBackground, 1);
+            EnsureMinimumAlphaInRect(pixels, width, height, BlockRect(window, i), hitTestColor, 1);
         }
     }
 
@@ -1565,20 +1990,39 @@ static LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPA
         {
             KillTimer(window, ForegroundRefreshTimerId);
             RefreshCurrentForegroundWindow();
-            CaptureThumbnailForDesktop(g_state.currentIndex);
             Log("Foreground icon refresh current=%d", g_state.currentIndex);
             RenderPager(window);
         }
         else if (wParam == SwitchRefreshTimerId)
         {
             KillTimer(window, SwitchRefreshTimerId);
-            int registryCurrentIndex = GetCurrentDesktopIndexFromRegistry();
-            if (registryCurrentIndex >= 0 && static_cast<size_t>(registryCurrentIndex) < g_state.ids.size())
+            bool updated = false;
+
+            if (g_hasPendingDesktopSwitch)
             {
-                g_state.currentIndex = registryCurrentIndex;
-                Log("Registry switch refresh current=%d", g_state.currentIndex);
-                RenderPager(window);
+                int newIndex = FindDesktopIndexById(g_pendingDesktopId);
+                if (newIndex >= 0 && static_cast<size_t>(newIndex) < g_state.ids.size())
+                {
+                    g_state.currentIndex = newIndex;
+                    ClearCurrentDesktopThumbnail();
+                    g_hasPendingDesktopSwitch = false;
+                    updated = true;
+                    Log("Pending switch refresh current=%d", g_state.currentIndex);
+                }
             }
+
+            if (!updated)
+            {
+                int registryCurrentIndex = GetCurrentDesktopIndexFromRegistry();
+                if (registryCurrentIndex >= 0 && static_cast<size_t>(registryCurrentIndex) < g_state.ids.size())
+                {
+                    g_state.currentIndex = registryCurrentIndex;
+                    ClearCurrentDesktopThumbnail();
+                    Log("Registry switch refresh current=%d", g_state.currentIndex);
+                }
+            }
+
+            RenderPager(window);
         }
         return 0;
 
@@ -1617,6 +2061,18 @@ static LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPA
         }
         return 0;
 
+    case WM_DRAGGED_WINDOW_DROPPED:
+    {
+        HWND draggedWindow = reinterpret_cast<HWND>(wParam);
+        int target = g_dragDropTarget >= 0 ? g_dragDropTarget : HitTestDesktopDropIndexFromScreen(window, g_dragDropPoint);
+        g_dragDropTarget = -1;
+        if (target >= 0)
+        {
+            MoveAppWindowToDesktop(draggedWindow, target);
+        }
+        return 0;
+    }
+
     case WM_MOUSEMOVE:
     {
         if (!g_trackingMouse)
@@ -1653,6 +2109,10 @@ static LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPA
         int target = HitTestDesktopIndex(window, point);
         if (target >= 0)
         {
+            if (GetTickCount() < g_suppressPagerClickUntil)
+            {
+                return 0;
+            }
             SwitchToDesktop(target);
         }
         return 0;
@@ -1704,6 +2164,7 @@ static LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPA
 int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int)
 {
     SetUnhandledExceptionFilter(UnhandledExceptionHandler);
+    ConfigureDpiAwareness();
     Log("Starting WorkspacePagerMvp");
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
