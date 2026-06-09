@@ -1,0 +1,38 @@
+ninja_required_version = 1.10
+
+builddir = .build
+clang = C:/Program Files/LLVM/bin/clang++.exe
+cxxflags = -std=c++17 -municode
+ldflags = -municode
+ldlibs = -lole32 -loleaut32 -luuid -luser32 -lshell32 -ladvapi32 -lgdi32
+
+rule cxx
+  command = "$clang" $cxxflags -MMD -MF $out.d -c $in -o $out
+  description = CXX $in
+  depfile = $out.d
+  deps = gcc
+
+rule link
+  command = "$clang" $ldflags $in $ldlibs -o $out
+  description = LINK $out
+
+build $builddir/WorkspacePagerMvp.obj: cxx WorkspacePagerMvp.cpp
+build $builddir/AppShared.obj: cxx AppShared.cpp
+build $builddir/DesktopManager.obj: cxx DesktopManager.cpp
+build $builddir/Hooks.obj: cxx Hooks.cpp
+build $builddir/OverlayLayout.obj: cxx OverlayLayout.cpp
+build $builddir/OverlayRender.obj: cxx OverlayRender.cpp
+build $builddir/Tray.obj: cxx Tray.cpp
+build $builddir/VirtualDesktop.obj: cxx VirtualDesktop.cpp
+
+build WorkspacePagerMvp.exe: link $
+  $builddir/WorkspacePagerMvp.obj $
+  $builddir/AppShared.obj $
+  $builddir/DesktopManager.obj $
+  $builddir/Hooks.obj $
+  $builddir/OverlayLayout.obj $
+  $builddir/OverlayRender.obj $
+  $builddir/Tray.obj $
+  $builddir/VirtualDesktop.obj
+
+default WorkspacePagerMvp.exe

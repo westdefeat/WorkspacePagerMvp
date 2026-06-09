@@ -2,7 +2,7 @@
 
 WorkspacePagerMvp is a small Win32/C++ prototype that adds a virtual desktop pager to the Windows taskbar. It shows one block per Windows virtual desktop, keeps cached thumbnail previews for inactive desktops, and lets you switch desktops by clicking or using the mouse wheel.
 
-The project is intentionally minimal: a single native source file, a PowerShell build script, and no external runtime dependency. It is built as an experiment around the Windows virtual desktop APIs and taskbar overlay behavior.
+The project is intentionally minimal: native C++ source files, a PowerShell build script, a Ninja build file, and no external runtime dependency. It is built as an experiment around the Windows virtual desktop APIs and taskbar overlay behavior.
 
 ## Features
 
@@ -29,6 +29,14 @@ No screenshot is included yet. The UI is a thin taskbar overlay made of desktop 
 C:\Program Files\LLVM\bin\clang++.exe
 ```
 
+- Ninja, available on `PATH`.
+
+If Ninja is missing, install it with:
+
+```powershell
+winget install --id Ninja-build.Ninja -e
+```
+
 ## Build
 
 From PowerShell:
@@ -38,13 +46,21 @@ cd "c:\Users\xiaolin\source\windows_workspaces\WorkspacePagerMvp"
 powershell -ExecutionPolicy Bypass -File .\build.ps1
 ```
 
+The build script calls Ninja, which compiles the C++ source files in parallel by default and writes intermediate object files under `.build/`.
+
+Limit the number of parallel build jobs:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\build.ps1 -Jobs 4
+```
+
 Build with a custom output file name:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\build.ps1 -Output WorkspacePagerMvpDebug.exe
 ```
 
-The build script compiles `WorkspacePagerMvp.cpp` with C++17 and links directly against the Win32 libraries used by the app.
+The build uses C++17 and links directly against the Win32 libraries used by the app.
 
 ## Run
 

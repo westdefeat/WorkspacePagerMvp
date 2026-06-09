@@ -1,8 +1,8 @@
 
 param(
-    [string]$Output = "WorkspacePagerMvp.exe"
+    [string]$Output = "WorkspacePagerMvp.exe",
+    [int]$Jobs = 0
 )
-taskkill /IM WorkspacePagerMvp.exe /F 
 
 $ErrorActionPreference = "Stop"
 
@@ -11,21 +11,27 @@ if (-not (Test-Path $clang)) {
     throw "clang++ not found at $clang"
 }
 
-& $clang `
-    -std=c++17 `
-    -municode `
-    "WorkspacePagerMvp.cpp" `
-    -lole32 `
-    -loleaut32 `
-    -luuid `
-    -luser32 `
-    -lshell32 `
-    -ladvapi32 `
-    -lgdi32 `
-    -o $Output
+$ninja = Get-Command ninja -ErrorAction SilentlyContinue
+if ($null -eq $ninja) {
+    throw "ninja not found. Install it with: winget install --id Ninja-build.Ninja -e"
+}
+
+cmd /c "taskkill /IM WorkspacePagerMvp.exe /F >nul 2>nul"
+New-Item -ItemType Directory -Force -Path ".build" | Out-Null
+
+$ninjaArgs = @("-f", "build.ninja")
+if ($Jobs -gt 0) {
+    $ninjaArgs += @("-j", $Jobs)
+}
+
+& $ninja.Source @ninjaArgs
 
 if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
+}
+
+if ($Output -ne "WorkspacePagerMvp.exe") {
+    Copy-Item -Force "WorkspacePagerMvp.exe" $Output
 }
 
 Write-Host "Built $Output"

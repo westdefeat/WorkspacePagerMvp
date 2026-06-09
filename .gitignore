@@ -4,6 +4,7 @@
 *.o
 *.pdb
 *.ilk
+.build/
 
 # Runtime logs
 *.log
